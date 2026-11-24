@@ -155,7 +155,7 @@ use crate::grand::{self, Rounds};
 use crate::hash::Digest;
 use crate::hidden::{Masked, Padded, Pads, Places, Room, Sent, Stream, send};
 use crate::ntt::Domain;
-use crate::parallel::{par_chunks_mut, par_fold};
+use crate::parallel::{par_chunks_mut, par_chunks_mut_with, par_fold};
 use crate::pcs::{self, Batched, Committed, Opens, Params, Work, eq_table};
 use crate::structure::{self, Acc, Direct, Ended, LOG_PACK, Public, groups, source_bit};
 pub use crate::structure::{Layout, variables};
@@ -357,25 +357,32 @@ pub fn pack(words: &[u32], log_cols: usize) -> Vec<F> {
     let wc = 1 << log_cols;
     let per_block = wc << LOG_W;
     let mut f = vec![F::ZERO; words.len() / wc / 128 * per_block];
-    par_chunks_mut(&mut f, per_block, |block, out| {
-        let rows = &words[block * 128 * wc..(block + 1) * 128 * wc];
-        // Half an element at a time, so that a word's 32 places are 32
-        // shifts of 64 bits.
-        for half in 0..2 {
-            let mut acc = vec![0u64; per_block];
-            for b in 0..64 {
-                let row = &rows[(half * 64 + b) * wc..(half * 64 + b + 1) * wc];
-                for (w, places) in row.iter().zip(acc.chunks_exact_mut(32)) {
-                    for (j, x) in places.iter_mut().enumerate() {
-                        *x |= ((*w >> j) as u64 & 1) << b;
+    // (The halves are gathered in room of a thread's own, cleared for
+    // each: not made for every half of every block.)
+    par_chunks_mut_with(
+        &mut f,
+        per_block,
+        || vec![0u64; per_block],
+        |acc, block, out| {
+            let rows = &words[block * 128 * wc..(block + 1) * 128 * wc];
+            // Half an element at a time, so that a word's 32 places are 32
+            // shifts of 64 bits.
+            for half in 0..2 {
+                acc.fill(0);
+                for b in 0..64 {
+                    let row = &rows[(half * 64 + b) * wc..(half * 64 + b + 1) * wc];
+                    for (w, places) in row.iter().zip(acc.chunks_exact_mut(32)) {
+                        for (j, x) in places.iter_mut().enumerate() {
+                            *x |= ((*w >> j) as u64 & 1) << b;
+                        }
                     }
                 }
+                for (o, x) in out.iter_mut().zip(acc.iter()) {
+                    o.0 |= (*x as u128) << (64 * half);
+                }
             }
-            for (o, x) in out.iter_mut().zip(&acc) {
-                o.0 |= (*x as u128) << (64 * half);
-            }
-        }
-    });
+        },
+    );
     f
 }
 
@@ -838,11 +845,15 @@ impl Rows {
     /// of an element is a row, so a block's 128 sums come of its
     /// elements' weights bucketed by their bytes.
     fn sums(f: &[F], program: &[F], claims: &[Claim], rows: usize) -> Vec<Vec<F>> {
-        let parts = crate::parallel::par_map_min(rows / 128, 1, |block| {
+        // (The buckets are a thread's own, cleared for each claim: made
+        // for each, they were asked for tens of thousands of times in
+        // a proof.)
+        let buckets = || vec![[F::ZERO; 256]; 16];
+        let parts = crate::parallel::par_map_with_min(rows / 128, 1, buckets, |t, block| {
             let mut out = Vec::with_capacity(claims.len());
             for claim in claims {
                 let (from, per_block) = (if claim.program { program } else { f }, claim.table.len());
-                let mut t = vec![[F::ZERO; 256]; 16];
+                t.iter_mut().for_each(|tq| *tq = [F::ZERO; 256]);
                 for (fp, m) in from[block * per_block..(block + 1) * per_block].iter().zip(&claim.table) {
                     if *m != F::ZERO {
                         for (q, tq) in t.iter_mut().enumerate() {
@@ -850,7 +861,7 @@ impl Rows {
                         }
                     }
                 }
-                out.push(from_buckets(&t));
+                out.push(from_buckets(t));
             }
             out
         });

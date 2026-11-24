@@ -569,12 +569,14 @@ program uses it yet: it is for the prover, and off unless asked for.
 Nothing that asks for memory is written differently for it.
 
 Measured on a block of a reward alone, at the main network's sizes,
-six cores, in a copy of the reference with this allocator:
+six cores, in a copy of the reference with this allocator. (How these
+were measured, and what they are worth, is under "The measures"
+below.)
 
 | | Without | With |
 |---|---|---|
-| Proving the block | 33 to 36 s | 20 to 25 s |
-| Processor time in the system | 15 to 16 s | 3 to 4 s |
+| Proving the block | about 31 s | about 19.5 s |
+| Processor time in the system | about 15 s | 3 to 4 s |
 | Held while proving | 4.4 GB, and nothing after | 6.5 GB, always |
 
 - Proving asks for 34 GB in all to make that proof, in 1.9 million
@@ -600,16 +602,48 @@ works too, on the pieces of its own loop that no thread has yet begun.
 A loop within a loop is safe, and a piece that panics ends no thread.
 No caller of the helpers is changed.
 
-The same block, the same way, with the threads standing:
+The same block, the same way, with the threads standing: about a
+second sooner, with the pool or without, which is no more than one run
+differs from the next. What it changes plainly is the processor time
+in the system: 12 s where it was 15 without the pool, and half a
+second where it was 3 to 4 with it.
 
-| | The reference | Threads standing | And the pool |
-|---|---|---|---|
-| Proving the block | 33 to 36 s | 29 to 31 s | 19 to 20 s |
-| Processor time in the system | 15 to 16 s | 11 to 12 s | 0.4 to 1.2 s |
+### Scratch of a thread's own
 
-Still to do in `shared` for the same end: scratch space of a thread's
-own where a loop makes it afresh each time round (97,000 allocations
-of 64 KB to 1 MB for that block, 7.5 GB in all).
+Three loops made their scratch space afresh for every item they went
+through. They now make it once a thread and clear it, by two helpers
+new to `parallel.rs` (`par_map_with_min`, `par_chunks_mut_with`):
+
+| Where | What was made each time |
+|---|---|
+| `argument::Rows::sums` | 64 KB of buckets, for every claim of every block of rows |
+| `argument::pack` | room for half a block's elements, twice a block |
+| `merkle::MerkleTree::with_more` | what a run of leaves is hashed from |
+
+For that one block, allocations of 4 KB to 1 MB went from 136,307
+(8.1 GB in all) to 25,462 (1.0 GB). It proves no sooner, to within
+what one run differs from the next.
+
+Two more are left as they are, 300 MB between them: `switch_sums` and
+`Columns::values` in `argument.rs`, where what is made is what the
+loop gives back (`par_fold`).
+
+### The measures
+
+One machine, six cores, a block of a reward alone, each proved twice.
+A run differs from the next by a second or two, and the machine by
+more than that from one hour to another: so two ways are held against
+each other only where they were run turn and turn about.
+
+| Run turn about | The one | The other |
+|---|---|---|
+| The pool: without, with | 29.8 to 31.6 s | 18.8 to 20.0 s |
+| Threads standing, no pool: without, with | 29.8 to 31.6 s | 29.7 to 30.2 s |
+| Threads standing, with the pool: without, with | 18.8 to 20.0 s | 18.4 to 19.7 s |
+| Scratch, with the pool and the threads: without, with | 20.4 to 22.7 s | 19.7 to 21.6 s |
+
+(An earlier measure had the threads alone worth four seconds: it held
+runs an hour apart against each other, and is wrong.)
 
 ### Left for the node
 

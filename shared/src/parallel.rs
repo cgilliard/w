@@ -280,7 +280,18 @@ pub fn par_map_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T +
     init: I,
     f: F,
 ) -> Vec<T> {
-    let ranges = ranges(n, MIN_PARALLEL);
+    par_map_with_min(n, MIN_PARALLEL, init, f)
+}
+
+/// As [`par_map_with`], but with an explicit serial threshold, as
+/// [`par_map_min`] has.
+pub fn par_map_with_min<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T + Sync>(
+    n: usize,
+    min_per_thread: usize,
+    init: I,
+    f: F,
+) -> Vec<T> {
+    let ranges = ranges(n, min_per_thread);
     if ranges.len() <= 1 {
         let mut state = init();
         return (0..n).map(|i| f(&mut state, i)).collect();
@@ -352,6 +363,38 @@ pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], ch
         job(move || {
             for (i, c) in chunks.chunks_mut(chunk).enumerate() {
                 f(k * per + i, c);
+            }
+        })
+    });
+    run(jobs.collect());
+}
+
+/// As [`par_chunks_mut`], with per-thread state made by `init` and
+/// passed to every call: scratch that a chunk's work would otherwise
+/// make afresh, as many times as there are chunks.
+pub fn par_chunks_mut_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize, &mut [T]) + Sync>(
+    data: &mut [T],
+    chunk: usize,
+    init: I,
+    f: F,
+) {
+    assert!(chunk > 0);
+    let n = data.len().div_ceil(chunk);
+    let t = threads().min(n).max(1);
+    if t <= 1 {
+        let mut state = init();
+        for (i, c) in data.chunks_mut(chunk).enumerate() {
+            f(&mut state, i, c);
+        }
+        return;
+    }
+    let per = n.div_ceil(t);
+    let (f, init) = (&f, &init);
+    let jobs = data.chunks_mut(per * chunk).enumerate().map(|(k, chunks)| {
+        job(move || {
+            let mut state = init();
+            for (i, c) in chunks.chunks_mut(chunk).enumerate() {
+                f(&mut state, k * per + i, c);
             }
         })
     });
@@ -591,6 +634,41 @@ mod tests {
 mod standing_tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// With state of a thread's own, the helpers do what they do
+    /// without: and the state is made once a thread, not once an item.
+    #[test]
+    fn state_is_made_once_a_thread() {
+        for n in [0usize, 1, 7, 1000, 100_003] {
+            let made = AtomicUsize::new(0);
+            let init = || {
+                made.fetch_add(1, Ordering::Relaxed);
+                Vec::<usize>::new()
+            };
+            let got = par_map_with_min(n, 1, init, |seen, i| {
+                seen.push(i);
+                (i, seen.len())
+            });
+            // Each thread's items in order, counted from one.
+            assert!(got.iter().enumerate().all(|(i, (at, nth))| *at == i && *nth >= 1 && *nth <= i + 1));
+            assert_eq!(got.len(), n);
+            assert!(made.load(Ordering::Relaxed) <= threads().max(1));
+            for chunk in [1usize, 3, 64] {
+                made.store(0, Ordering::Relaxed);
+                let (mut with, mut without) = (vec![0usize; n], vec![0usize; n]);
+                par_chunks_mut_with(&mut with, chunk, init, |seen, k, c| {
+                    seen.clear();
+                    seen.extend(c.iter().enumerate().map(|(j, _)| chunk * k + j));
+                    c.copy_from_slice(seen);
+                });
+                par_chunks_mut(&mut without, chunk, |k, c| {
+                    c.iter_mut().enumerate().for_each(|(j, x)| *x = chunk * k + j)
+                });
+                assert_eq!(with, without);
+                assert!(made.load(Ordering::Relaxed) <= threads().max(1));
+            }
+        }
+    }
 
     /// A loop within a loop within a loop comes to its end, with every
     /// thread there is already busy in the outer ones: whoever runs an

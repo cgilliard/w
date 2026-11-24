@@ -16,7 +16,7 @@
 
 use crate::field::{F, as_bytes};
 use crate::hash::{DOM_LEAF, DOM_NODE, Digest, hash_domain, hash_domain_many};
-use crate::parallel::par_chunks_mut;
+use crate::parallel::{par_chunks_mut, par_chunks_mut_with};
 
 pub struct MerkleTree {
     /// The leaves' hashes, then each level above, the root last.
@@ -50,16 +50,23 @@ impl MerkleTree {
         assert!(n.is_power_of_two() && n * leaf == data.len() && more.iter().all(|m| m.len() == n));
         let item = (leaf + more.len()) * F::BYTES;
         let mut hashes = vec![[0u8; 32]; n];
-        par_chunks_mut(&mut hashes, RUN, |i, o| {
-            let mut input = Vec::with_capacity(o.len() * item);
-            for at in i * RUN..i * RUN + o.len() {
-                input.extend_from_slice(&as_bytes(&data[at * leaf..(at + 1) * leaf]));
-                for m in more {
-                    input.extend_from_slice(&as_bytes(&m[at..at + 1]));
+        // (What a run of leaves is hashed from is gathered in room of
+        // a thread's own, not made for every run.)
+        par_chunks_mut_with(
+            &mut hashes,
+            RUN,
+            || Vec::with_capacity(RUN * item),
+            |input, i, o| {
+                input.clear();
+                for at in i * RUN..i * RUN + o.len() {
+                    input.extend_from_slice(&as_bytes(&data[at * leaf..(at + 1) * leaf]));
+                    for m in more {
+                        input.extend_from_slice(&as_bytes(&m[at..at + 1]));
+                    }
                 }
-            }
-            hash_domain_many(DOM_LEAF, &input, item, o);
-        });
+                hash_domain_many(DOM_LEAF, input, item, o);
+            },
+        );
         MerkleTree::over(hashes)
     }
 
