@@ -131,6 +131,23 @@ pub fn key_commitment(key_hash: &Digest, amount: u64) -> Commitment {
     crate::ledger::commitment(key_hash, amount)
 }
 
+/// An unspent output as the state keeps it: what its leaf is made of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Record {
+    pub commitment: Commitment,
+    pub memo: Memo,
+    pub amount: u64,
+    /// The height of the block that made it.
+    pub height: u32,
+}
+
+impl Record {
+    /// Its leaf in the tree while it is unspent.
+    pub fn leaf(&self) -> Digest {
+        output_leaf(&self.commitment, &self.memo, self.amount, self.height)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------

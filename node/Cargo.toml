@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 # The dev networks (`--network dev`, `dev-recursive`): their built-in
 # dataset and plan. Off by default, so release builds carry none of it.
-dev = []
+dev = ["tabshared/dev"]
 
 # No dependencies from outside this repository: the standard library,
 # and what the four programs share.

@@ -51,7 +51,7 @@ use core::ops::Deref;
 
 use crate::codec::{DIGEST_BYTES, POSITION_BYTES, read_digest, read_position, write_position};
 use crate::error::Error;
-use crate::hash::{DOM_OP, DOM_RECORD, DOM_UPDATE, Digest, digest_to_bytes, hash_domain};
+use crate::hash::{DOM_NAME_LEAF, DOM_OP, DOM_RECORD, DOM_UPDATE, Digest, digest_to_bytes, hash_domain};
 use crate::output::{Key as OwnerKey, MEMO_BYTES, Memo, Sig, memo_from_bytes, memo_to_bytes, pubkey_hash};
 use crate::registry;
 use crate::xmss::PublicKey;
@@ -656,6 +656,25 @@ impl NameOp {
             }
         }
     }
+}
+
+/// The root of the names' tree with no names.
+pub fn empty_root() -> Digest {
+    registry::empty_roots()[KEY_BITS]
+}
+
+/// The leaf of the name whose hash is `name` and whose record's value
+/// is `value` ([`Record::leaf_value`]).
+pub fn leaf_hash(name: &Digest, value: &Digest) -> Digest {
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(name);
+    block[32..].copy_from_slice(value);
+    hash_domain(DOM_NAME_LEAF, &block)
+}
+
+/// A record's leaf.
+pub fn leaf_of(r: &Record) -> Digest {
+    leaf_hash(&r.name.hash(), &r.leaf_value())
 }
 
 #[cfg(test)]

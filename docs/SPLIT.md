@@ -65,13 +65,11 @@ docs/
   repository".
 - `[profile.release]` moves to the root `Cargo.toml` (Cargo ignores it
   in workspace members). `.gitignore` gains `/target`.
-- `resources/` here lacks `setup-dev.bin` and `setup-mainnet.bin`,
-  which the reference has in `tmp/v/resources/`. They need to be
-  added.
 - `scripts/tabminer.sh` (empty) is renamed `scripts/node.sh`.
 
-The shared library exists (`shared/`), and holds `blake3` so far. The
-workspace does not yet: each crate is built on its own for now.
+The shared library exists (`shared/`): section 12 says what is in it
+and how it differs from the reference. The workspace does not yet:
+each crate is built on its own for now.
 
 ## 3. Which module goes where
 
@@ -497,7 +495,6 @@ to be read in full when it is taken up.
 
 ### Found while reading for this document
 
-- `resources/` lacks the two setup files (section 2).
 - The default data directory is `~/.tabernacle/tabminer`, for a
   program now called `tabnode`.
 - The wallet's `Cargo.toml` has no `dev` feature. That is right: the
@@ -526,3 +523,92 @@ and its tests run.
 7. **A late reveal of a name** (7.4): what it costs.
 8. **Other tools on the API.** If explorers or exchanges are to use
    it, some requests want to be read without the secret. Which?
+
+## 12. What has been moved, and how it differs from the reference
+
+Kept up as the work goes. `shared/` holds everything section 3 lists
+for it but the option parser, and `http` and `json`, which are new.
+
+### The rule
+
+A file is copied as it is. What is changed after that is one of three
+things, and nothing else:
+
+- what Clippy asks for;
+- a whole item moved to another file, so that no module depends on one
+  that depends on it;
+- what a file needs to stand without the node's store.
+
+One thing is new, and not of those: `heap::pool`, below.
+
+### Where things are that the reference has elsewhere
+
+| In the reference | Here | Why |
+|---|---|---|
+| `ledger::{Memo, Output, key_hash, commitment}` | `listed` (new); `ledger` gives them out again | `conditions` and `registry` need them, and `ledger` needs those two |
+| `alg::{Sym, Shared, Compiler, Hashed, HashedOpens}`, and `alg`'s tests | `sym` (new) | `alg` is under everything; these are over `pcs` and `recursion` |
+| `argument::{switched, roots_of_x}` | `alg` | the transcript in `alg` calls them |
+| `argument::Rounds` | `grand` | `grand` is under `argument` |
+| `argument::{Layout, variables}`, `LOG_PACK` | `structure`; `argument` gives the first two out again | `hidden` is under `argument`. `LOG_PACK` was defined twice |
+| `reading::{Reader, Direct}` | `structure` | `structure`, `hidden` and `argument` need the trait; the rest of `reading` is over `sym` |
+| `chain::verify` | `verify` | `prover` needs it, and `chain` is the node's |
+| `chain::params` | `params` | the same; and `params` needs `prover` |
+| `store::outputs::Record` | `output::Record` | `prover` needs it |
+| `store::names::{leaf_hash, leaf_of, empty_root}` | `name` | `prover` and `params` need them |
+| `store::state::empty_state` | `store::sparse::empty_state` | `params` needs it |
+| `U256::not`, `U256::div` | the operators `!` and `/` | Clippy |
+
+No module of `shared` depends on one that depends on it, outside of
+tests. A file's tests may still use what is above it.
+
+### Memory of a fixed size: `heap::pool`
+
+The allocator can keep one part's blocks of a megabyte or more, and
+hand them out again, in place of giving them back to the system. No
+program uses it yet: it is for the prover, and off unless asked for.
+Nothing that asks for memory is written differently for it.
+
+Measured on a block of a reward alone, at the main network's sizes,
+six cores, in a copy of the reference with this allocator:
+
+| | Without | With |
+|---|---|---|
+| Proving the block | 33 to 36 s | 20 to 25 s |
+| Processor time in the system | 15 to 16 s | 3 to 4 s |
+| Held while proving | 4.4 GB, and nothing after | 6.5 GB, always |
+
+- Proving asks for 34 GB in all to make that proof, in 1.9 million
+  allocations, and holds 4.4 GB of it at the most. About 300 of the
+  allocations are of 16 MB or more, and come to 22 GB of the 34.
+- The pool keeps blocks by their exact size: fifty sizes, of which it
+  keeps as many as were ever out at once. That is why it holds more
+  than the 4.4 GB: the sizes are not all out at the same moment.
+- Kept so, no block was asked of the system in proving the block
+  again (`pool::misses`).
+- Not done: a larger block that is idle given for a smaller one, which
+  would bring what is kept nearer to what is used.
+- Not measured: a block with signatures. With 64 or fewer, one of its
+  proofs has tables of twice the size (8.2 GB at the most, by the
+  reference's own measure); with more, it has not.
+
+Still to do in `shared` for the same end: threads that stand
+(`parallel.rs` begins 33,530 of them for that one block), and scratch
+space of a thread's own where a loop makes it afresh each time round
+(97,000 allocations of 64 KB to 1 MB, 7.5 GB in all).
+
+### Left for the node
+
+- `prover::Witness::collect`, which reads the state from the store.
+- The tests of `prover.rs` (thirteen, about 700 lines): they make a
+  chain to prove blocks of. Until `chain` is in the node, nothing here
+  tests that a block's proof is one a chain takes.
+- The rest of `store` (`state`, `trie`, `outputs`, `names`, `window`,
+  `blocks`, `commits`, `receive`). Where it defined what is now in
+  `shared`, it is to give that out again under the old name.
+
+### Still to decide
+
+- The domain tags and the hashing under them in `hash.rs` are
+  `pub(crate)`. The node's `store/names.rs`, and the wallet, use them.
+- The helpers of tests (`test_util`, `store::testing`) are seen only
+  by `shared`'s own tests. The node's and the wallet's tests use them.
