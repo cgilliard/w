@@ -13,6 +13,9 @@ dev = ["tabshared/dev"]
 [dependencies]
 tabshared = { path = "../shared" }
 
+[dev-dependencies]
+tabshared = { path = "../shared", features = ["testing"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

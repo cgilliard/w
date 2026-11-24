@@ -645,19 +645,59 @@ each other only where they were run turn and turn about.
 (An earlier measure had the threads alone worth four seconds: it held
 runs an hour apart against each other, and is wrong.)
 
+### What finished `shared`
+
+- `options`: how a program is told what to do, from the general part
+  of `configuration.rs`. The node's list of options is the node's.
+- `fees`: the weights, the floor and a node's policy, from
+  `mempool.rs`. The wallet pays by them. The pool is the node's, and
+  is to give these out again under their old names.
+- `proofs`, whole: one set of types makes a proof of payment and
+  checks it. With it `base64`, from the wallet, and
+  `store::sparse::{STATE_HEIGHT, root_of_state_path}`, from the node's
+  store.
+- `terminal`, whole: it has the reading of a line that is not shown,
+  which the node needs for the mining phrase.
+- `json` and `http`, new: section 4 says what they are held to.
+
+`docs/MEMORY.md` has what each module asks of the heap, and for which
+program.
+
+### The node, so far
+
+`node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
+`blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
+`leaves`, `receive`, `debug`), and `proving`: 73 tests, 4 ignored.
+
+- What `tabshared` has is in the node under the names it has there
+  (`pub use tabshared::*` at the crate's root), so that a file of the
+  reference's that says `crate::hash` says so still. The node's own
+  `store` and `chain` are over `tabshared`'s, and give out again what
+  is there (`store::pagefile`, `chain::params`, `chain::verify`).
+- What the node's store defined that is now in `tabshared` it gives
+  out again under the old name: `outputs::Record`,
+  `names::{leaf_hash, leaf_of, empty_root}`,
+  `state::{empty_state, STATE_HEIGHT, root_of_state_path}`.
+- `proving` is new: `witness_of`, which was `prover::Witness::collect`,
+  and the tests of the prover that make a chain and have it take what
+  they prove. The tests of the prover that need no chain are back in
+  `tabshared::prover`. So a block proven by `tabshared` is again taken
+  by a chain, in a test.
+- `tabshared` has a `testing` feature, which the node's tests turn on:
+  with it, `test_util` and `store::testing` are seen from outside.
+- `hash::hash_domain` is public. The table of domain tags is not: the
+  node's files use none of them now.
+
 ### Left for the node
 
-- `prover::Witness::collect`, which reads the state from the store.
-- The tests of `prover.rs` (thirteen, about 700 lines): they make a
-  chain to prove blocks of. Until `chain` is in the node, nothing here
-  tests that a block's proof is one a chain takes.
-- The rest of `store` (`state`, `trie`, `outputs`, `names`, `window`,
-  `blocks`, `commits`, `receive`). Where it defined what is now in
-  `shared`, it is to give that out again under the old name.
+- `mempool`, `transport`, `net`, and what of `miner`, `configuration`,
+  `console` and `main` is the node's.
 
 ### Still to decide
 
-- The domain tags and the hashing under them in `hash.rs` are
-  `pub(crate)`. The node's `store/names.rs`, and the wallet, use them.
-- The helpers of tests (`test_util`, `store::testing`) are seen only
-  by `shared`'s own tests. The node's and the wallet's tests use them.
+- The wallet defines domain tags of its own (66, 67, 70 and others),
+  apart from the table in `hash.rs`: nothing holds the two against
+  each other.
+- A block with signatures has not been measured with the pool; and the
+  pool keeps 6.5 GB for 4.4 GB used, which a larger block that is idle
+  given for a smaller one would bring down.
