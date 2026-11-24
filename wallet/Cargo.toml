@@ -1,12 +1,7 @@
 [package]
-name = "tabminer"
+name = "tabwallet"
 version = "0.1.0"
 edition = "2024"
-
-[features]
-# The dev networks (`--network dev`, `dev-recursive`): their built-in
-# dataset and plan. Off by default, so release builds carry none of it.
-dev = []
 
 # No dependencies: the standard library and nothing else.
 [dependencies]

@@ -1,0 +1,7 @@
+[package]
+name = "tabshared"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies: the standard library and nothing else.
+[dependencies]

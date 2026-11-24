@@ -1,0 +1,3 @@
+resources/bip39-english.txt text eol=lf
+shared/tests/vectors/*.kat text eol=lf
+resources/*.bin binary

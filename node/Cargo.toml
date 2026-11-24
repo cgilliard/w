@@ -1,5 +1,5 @@
 [package]
-name = "tabminer"
+name = "tabnode"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,8 +8,10 @@ edition = "2024"
 # dataset and plan. Off by default, so release builds carry none of it.
 dev = []
 
-# No dependencies: the standard library and nothing else.
+# No dependencies from outside this repository: the standard library,
+# and what the four programs share.
 [dependencies]
+tabshared = { path = "../shared" }
 
 [profile.release]
 codegen-units = 1

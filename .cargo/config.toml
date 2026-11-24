@@ -1,0 +1,6 @@
+# Built for the processor of the machine that builds it: so AVX2 is used
+# where that processor has it (Blake3 then hashes eight inputs at a
+# time), and left out where it has not. A binary built this way is for
+# that machine: it may not run on an older processor.
+[build]
+rustflags = ["-C", "target-cpu=native"]
