@@ -797,8 +797,15 @@ mod tests {
             }
         });
         let said = seen_of(BIG);
-        assert_eq!((said.asked - asked, said.hits + said.misses, held(Part::Test)), (400, said.asked, before));
+        assert_eq!((said.asked - asked, said.hits + said.misses), (400, said.asked));
         assert!(said.most <= 8 + 2);
+        // (What a thread held of its own is given back as it ends,
+        // which may be a moment after it is done.)
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while held(Part::Test) != before && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(held(Part::Test), before);
         drop(in_test);
         // No more is kept than it was told to keep.
         pool::learn(Part::Test, BIG);

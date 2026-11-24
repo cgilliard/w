@@ -46,8 +46,8 @@ pub mod freemap;
 pub mod pagefile;
 pub mod partial;
 pub mod sparse;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use backend::{Backend, DirLock, FileBackend, ReadReq, WriteReq};
 pub use pagefile::{Extent, PageFile, Pin, ROOT_MAX, ReadPages, Root, Txn, UNIT};

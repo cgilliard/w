@@ -1362,3 +1362,220 @@ impl ProofVerifier for ChainVerifier {
         true
     }
 }
+
+/// The tests that need no chain. Those that prove a chain's blocks, and
+/// have a chain take them, are the node's (`proving`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{Body, BodyRef};
+    use crate::params::ChainParams;
+
+    /// Makes the main network's setup and writes its numbers down: what
+    /// the program then has built in. Minutes of proving.
+    #[test]
+    #[ignore = "makes the main network's setup; run with --release --nocapture"]
+    fn write_the_main_network_s_setup() {
+        let began = std::time::Instant::now();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let said = |line: &str| println!("{line}");
+        let setup = Setup::new_said(Level::MAINNET, Emission(ChainParams::MAINNET.emission), &text.at(0), &said);
+        let parts = setup.parts();
+        println!(
+            "the main network's setup: {} shapes, the chain's proof of 2^{} elements in tables of {:?} rows, made in {:.0?}",
+            parts.shapes.len(),
+            parts.m,
+            parts.tables,
+            began.elapsed()
+        );
+        println!("the step's program: {:?}", parts.own);
+        std::fs::write("../resources/setup-mainnet.bin", parts.to_bytes()).unwrap();
+        assert!(Parts::from_bytes(&parts.to_bytes()).as_ref() == Some(&parts));
+    }
+
+    /// The setup built in is the main network's: its step's program is
+    /// the one the network's parameters name, and it lists the shapes of
+    /// the main network's level.
+    #[test]
+    fn the_setup_built_in_is_the_main_network_s() {
+        let (parts, level) = (Parts::mainnet(), Level::MAINNET);
+        assert_eq!(parts.own, MAINNET_PROGRAM);
+        assert_eq!(parts.own, ChainParams::MAINNET.program);
+        assert_eq!(parts.shapes.len(), 1 + (level.trees + 1) * (level.runs.len() + level.joins));
+        assert_eq!((parts.nodes.len(), parts.joins.len()), (level.trees, level.joins));
+    }
+
+    /// Makes the dev networks' setup and writes its numbers down: what
+    /// a program built with the dev feature has built in. A change to a
+    /// circuit changes the file, and the file kept is to be the one
+    /// this writes.
+    #[test]
+    #[ignore = "makes the dev networks' setup; run with --release"]
+    fn write_the_dev_networks_setup() {
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::DEV);
+        let setup = Setup::new(Level::SMALL, Emission(ChainParams::DEV.emission), &text.at(0));
+        assert_eq!(ChainParams::DEV.emission, ChainParams::DEV_RECURSIVE.emission);
+        let parts = setup.parts();
+        std::fs::write("../resources/setup-dev.bin", parts.to_bytes()).unwrap();
+        assert!(Parts::from_bytes(&parts.to_bytes()).as_ref() == Some(&parts));
+    }
+
+    /// What a block's transactions are dealt out to: runs of no more
+    /// rows than a run holds, a transaction cut between its parts where
+    /// it does not fit, the reward's first.
+    #[test]
+    fn transactions_are_dealt_out_among_runs() {
+        use crate::ledger::{Input, Output as Made, Transaction as Rule};
+        let key = crate::xmss::SecretKey::generate_with_height(&[1; 32], 1).public_key();
+        let memo = Default::default();
+        let made = Made::to(&[1; 32], 5, memo);
+        let rule = |inputs: usize, outputs: usize| Rule {
+            inputs: (0..inputs as u64).map(|position| Input { key, amount: 5, memo, created: 1, position }).collect(),
+            outputs: vec![made; outputs],
+            ..Default::default()
+        };
+        let all = |groups: &[Vec<Item>]| groups.iter().flatten().copied().collect::<Vec<Item>>();
+        // A reward alone, and a payment beside it: one run, everything
+        // in its order.
+        assert_eq!(grouped(0, &[], 0, 0, 1 << 11), Some(vec![vec![Item::Reward]]));
+        let one = grouped(7, &[rule(2, 2)], 0, 0, 1 << 12).unwrap();
+        let want =
+            [Item::Reward, Item::Head(0), Item::Input(0, 0), Item::Input(0, 1), Item::Output(0, 0), Item::Output(0, 1)];
+        assert_eq!(one, vec![want.to_vec()]);
+        // More than a run holds: several, nothing lost and nothing
+        // twice, a transaction lying across them.
+        let many = [rule(30, 40), rule(1, 600), rule(25, 1)];
+        let runs = grouped(1000, &many, 0, 0, 1 << 12).unwrap();
+        assert!(runs.len() > 2, "{} runs", runs.len());
+        let whole = grouped(1000, &many, 0, 0, usize::MAX / 2).unwrap();
+        assert_eq!((whole.len(), all(&runs)), (1, all(&whole)));
+        assert!(runs.iter().any(|run| matches!(run[0], Item::Output(1, _))), "no run begins inside a transaction");
+        // The operations on names and the sweeps are the last run's,
+        // and take a run of their own where they do not fit the last.
+        let alone = grouped(1000, &many, 0, 0, 1 << 12).unwrap().len();
+        let with = grouped(1000, &many, 3, 3, 1 << 12).unwrap().len();
+        assert!(with >= alone);
+        // More of them than a run holds, or one input that is: no runs.
+        assert_eq!(grouped(0, &[], 100, 0, 1 << 11), None);
+        assert_eq!(grouped(0, &[rule(1, 1)], 0, 0, 64), None);
+    }
+
+    /// The numbers of the main network's setup, as the program has them
+    /// built in, are written and read back the same; what is not such a
+    /// file is none.
+    #[test]
+    fn a_setup_s_numbers_are_written_and_read() {
+        let parts = Parts::mainnet();
+        let bytes = parts.to_bytes();
+        assert!(Parts::from_bytes(&bytes).as_ref() == Some(&parts));
+        assert_eq!(parts.own, MAINNET_PROGRAM);
+        assert!(Parts::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(Parts::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
+        assert!(Parts::from_bytes(&[]).is_none());
+        // Of another way of writing them down.
+        let mut other = bytes.clone();
+        other[0] ^= 1;
+        assert!(Parts::from_bytes(&other).is_none());
+        // Every count in it at the values of its bounds: read without
+        // failing, as itself or as nothing or as another.
+        let (fields, panicked, _) =
+            crate::codec::sweep_fields(&bytes, |b| Parts::from_bytes(b).map(|read| read != parts));
+        assert!(fields >= 4 && panicked.is_empty(), "{fields} counts: {panicked:#?}");
+        // Sizes that are no sizes.
+        let at = 8 + parts.shapes.len() * 32 * (1 + PROGRAMS) + 64;
+        let mut other = bytes.clone();
+        other[at] = 3;
+        assert!(Parts::from_bytes(&other).is_none());
+        assert_eq!((Level::MAINNET.signatures(), Level::SMALL.signatures()), (64 << 9, 2 << 1));
+    }
+
+    /// The part of the registry a block's proof takes: the leaves it
+    /// touches with their paths, which go on being the tree's as the
+    /// leaves are changed.
+    #[test]
+    fn a_part_of_the_registry_follows_its_changes() {
+        use crate::registry::{HEIGHT, node};
+        let root_of = |leaf: &Digest, key: Key, path: &[Digest]| {
+            (0..HEIGHT).fold(*leaf, |at, level| match (key >> level) & 1 {
+                1 => node(&path[level], &at),
+                _ => node(&at, &path[level]),
+            })
+        };
+        // Two leaves of a tree that is otherwise of nothing.
+        let empty: Vec<Digest> = {
+            let mut all = vec![EMPTY];
+            (0..HEIGHT).for_each(|level| all.push(node(&all[level], &all[level])));
+            all
+        };
+        let (a, b): (Key, Key) = (5, 5 ^ (1 << 100));
+        let mut part = NamesPart::default();
+        part.load(a, &EMPTY, &empty[..HEIGHT]);
+        part.load(b, &EMPTY, &empty[..HEIGHT]);
+        assert_eq!(part.path(a), empty[..HEIGHT]);
+        // One is set: the other's path says so, and both give one root.
+        part.set(a, &[7; 32]);
+        let root = root_of(&[7; 32], a, &part.path(a));
+        assert_ne!(root, empty[HEIGHT]);
+        assert_eq!(root_of(&EMPTY, b, &part.path(b)), root);
+        part.set(b, &[9; 32]);
+        assert_eq!(root_of(&[9; 32], b, &part.path(b)), root_of(&[7; 32], a, &part.path(a)));
+    }
+
+    /// A block that pays its reward and nothing else is one run, whose
+    /// rows hold; and a verifier takes no proof that is none, unless it
+    /// is told to take them all.
+    #[test]
+    fn a_reward_s_run_holds_and_what_is_no_proof_is_refused() {
+        let reward = crate::output::Output::to_key_hash(&[3; 32], 50);
+        let record = Record::block(&crate::ledger::Outputs::default(), 1, 50);
+        let contents = Contents { txs: &[], sweeps: &[], reward: &reward };
+        let set = signed::empty_roots()[signed::DEPTH];
+        let mut runs = Setup::runs_of(&record, &set, &mut Witness::default(), &contents, None, None).unwrap();
+        assert_eq!(runs.len(), 1);
+        let (rows, program, public) = runs.remove(0).finish(128);
+        assert!(segment::holds(&rows, &program, &public));
+        // A transaction's signatures are looked for in a proof of them:
+        // with none, there are no runs.
+        let parts = Parts::mainnet();
+        let verifier = ChainVerifier::of(&Level::MAINNET, &parts);
+        assert!(verifier.attests_work() && !verifier.is_unchecked());
+        let body = Body::default().to_bytes();
+        let stated = Statement { program: parts.own, ..Statement::genesis() };
+        let statement =
+            BlockStatement { chain: stated, digest: stated.digest(), body: BodyRef::from_bytes(&body).unwrap() };
+        assert!(!verifier.verify(&statement, &[]) && !verifier.verify(&statement, &[0; 1000]));
+        // Of another step's program: refused before it is read.
+        let other = Statement { program: [1; 32], ..stated };
+        let of_other = BlockStatement { chain: other, digest: other.digest(), body: statement.body };
+        assert!(!verifier.verify(&of_other, &[]));
+        let unchecked = verifier.unchecked();
+        assert!(unchecked.is_unchecked() && unchecked.verify(&statement, &[]));
+    }
+
+    /// A block with as many of each operation on names as a block may
+    /// have, and as many sweeps, is one a run of the main network holds:
+    /// what the chain allows of them and what a proof has room for are
+    /// said in two places, and the first is not to pass the second. (And
+    /// the two places the chain's limits are written agree; each is a
+    /// count the circuit keeps as a bit of a word.)
+    #[test]
+    fn a_block_at_every_limit_fits_a_run() {
+        use crate::name::OpKind;
+        let limits = [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].map(OpKind::cap);
+        let said = [crate::registry::MAX_COMMITS, crate::registry::MAX_REVEALS, crate::registry::MAX_UPDATES];
+        assert_eq!((limits[..3].to_vec(), limits[3]), (said.to_vec(), crate::registry::MAX_SWEEPS));
+        assert!(limits.iter().all(|limit| *limit < 32));
+        let ops: usize = limits[..3].iter().sum();
+        for log in Level::MAINNET.runs {
+            // By themselves, after the reward; and after transactions
+            // that fill runs before them, in a last run of their own.
+            let alone = grouped(u64::MAX >> 24, &[], ops, limits[3], 1 << log).expect("a run holds them");
+            assert_eq!(alone.len(), 1, "a run of 2^{log} rows");
+        }
+        // They are less than half of the smallest: a block's last run
+        // has room for transactions beside them.
+        let tail = ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT)
+            + limits[3] * (2 + 2 * OUTPUTS_HEIGHT);
+        assert!(2 * tail < 1 << Level::MAINNET.runs[0], "{tail} rows");
+    }
+}

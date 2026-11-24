@@ -228,7 +228,7 @@ pub(crate) const fn domain_key(domain: u32) -> [u32; 8] {
 }
 
 /// The hash of `input` in `domain`.
-pub(crate) fn hash_domain(domain: u32, input: &[u8]) -> Digest {
+pub fn hash_domain(domain: u32, input: &[u8]) -> Digest {
     blake3::keyed_hash_words(&domain_key(domain), input)
 }
 

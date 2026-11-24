@@ -44,10 +44,16 @@ thread_local! {
 /// hook is the process's, and tests run in parallel, so swapping it
 /// would hide other tests' failures, and two swaps overlapping could
 /// leave it silent for the rest of the run.
-pub(crate) struct Quiet(bool);
+pub struct Quiet(bool);
+
+impl Default for Quiet {
+    fn default() -> Quiet {
+        Quiet::new()
+    }
+}
 
 impl Quiet {
-    pub(crate) fn new() -> Quiet {
+    pub fn new() -> Quiet {
         static HOOK: std::sync::Once = std::sync::Once::new();
         HOOK.call_once(|| {
             let report = std::panic::take_hook();
@@ -71,7 +77,7 @@ impl Drop for Quiet {
 /// `iters` times `TABMINER_FUZZ_SCALE` (1 by default; the nightly run,
 /// `fuzz.yml`, sets it), and `TABMINER_FUZZ_SEED`, else `seed`. Prints
 /// the seed so a failure can be replayed.
-pub(crate) fn fuzz_params(iters: u64, seed: u64) -> (u64, u64) {
+pub fn fuzz_params(iters: u64, seed: u64) -> (u64, u64) {
     let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
     let scaled = iters.saturating_mul(var("TABMINER_FUZZ_SCALE").unwrap_or(1));
     let (iters, seed) = (var("TABMINER_FUZZ_ITERS").unwrap_or(scaled), var("TABMINER_FUZZ_SEED").unwrap_or(seed));

@@ -7,6 +7,9 @@ edition = "2024"
 # The dev networks (`--network dev`, `dev-recursive`): their built-in
 # dataset and plan. Off by default, so release builds carry none of it.
 dev = []
+# What tests share (a generator of test values, a file in memory that
+# can lose power): for the tests of the programs built on this.
+testing = []
 
 # No dependencies: the standard library and nothing else.
 [dependencies]

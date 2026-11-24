@@ -31,6 +31,17 @@ pub fn empty_state() -> Digest {
     crate::registry::state_root(empty(HEIGHT), &crate::name::empty_root())
 }
 
+/// Digests of an output's path to the state's root: the siblings in the
+/// outputs' tree, the lowest first, and then the names' root.
+pub const STATE_HEIGHT: usize = HEIGHT + 1;
+
+/// The state's root a path of an output leads to: from the leaf at
+/// `position` up the outputs' tree, and that root with the names'.
+pub fn root_of_state_path(position: u64, leaf: &Digest, path: &[Digest; STATE_HEIGHT]) -> Digest {
+    let outputs = root_of_path(position, leaf, &path[..STATE_HEIGHT - 1]);
+    crate::registry::state_root(&outputs, &path[STATE_HEIGHT - 1])
+}
+
 /// The root of a subtree, from its nonempty nodes at a level below.
 ///
 /// `nodes` are `(index, hash)` at `level` (a leaf is level 0; the node of

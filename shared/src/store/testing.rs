@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use super::backend::Backend;
 
 /// A fresh directory for one test, under the system's temporary one.
-pub(crate) fn temp_dir(name: &str) -> PathBuf {
+pub fn temp_dir(name: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("tabminer-store-{name}-{}-{n}", std::process::id()));
@@ -19,7 +19,7 @@ pub(crate) fn temp_dir(name: &str) -> PathBuf {
 
 /// What a crash does to the writes not yet made durable.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Lost {
+pub enum Lost {
     /// None of them reached the disk.
     All,
     /// All of them did.
@@ -49,7 +49,7 @@ struct Mem {
 /// at once and durable only after a sync. Power can be set to fail at
 /// any write or sync, which then returns an error, as does everything
 /// after; [`MemBackend::image`] is what a disk might then hold.
-pub(crate) struct MemBackend {
+pub struct MemBackend {
     inner: Mutex<Mem>,
 }
 
@@ -61,13 +61,19 @@ fn apply(file: &mut Vec<u8>, offset: u64, data: &[u8]) {
     file[offset as usize..end].copy_from_slice(data);
 }
 
+impl Default for MemBackend {
+    fn default() -> MemBackend {
+        MemBackend::new()
+    }
+}
+
 impl MemBackend {
-    pub(crate) fn new() -> MemBackend {
+    pub fn new() -> MemBackend {
         MemBackend::from_image(Vec::new())
     }
 
     /// A file holding `image`, all of it durable.
-    pub(crate) fn from_image(image: Vec<u8>) -> MemBackend {
+    pub fn from_image(image: Vec<u8>) -> MemBackend {
         let mem = Mem {
             durable: image.clone(),
             current: image,
@@ -81,28 +87,28 @@ impl MemBackend {
     }
 
     /// Power fails at the `n`-th write or sync from now (1 is the next).
-    pub(crate) fn crash_at(&self, n: u64) {
+    pub fn crash_at(&self, n: u64) {
         let mut m = self.inner.lock().unwrap();
         m.crash_at = m.ops + n;
     }
 
     /// Reads so far.
-    pub(crate) fn reads(&self) -> u64 {
+    pub fn reads(&self) -> u64 {
         self.inner.lock().unwrap().reads
     }
 
     /// Writes and syncs so far.
-    pub(crate) fn ops(&self) -> u64 {
+    pub fn ops(&self) -> u64 {
         self.inner.lock().unwrap().ops
     }
 
-    pub(crate) fn crashed(&self) -> bool {
+    pub fn crashed(&self) -> bool {
         self.inner.lock().unwrap().crashed
     }
 
     /// What the disk holds if power is lost now, the writes since the
     /// last sync surviving as `lost` says.
-    pub(crate) fn image(&self, lost: Lost) -> Vec<u8> {
+    pub fn image(&self, lost: Lost) -> Vec<u8> {
         let m = self.inner.lock().unwrap();
         let mut out = m.durable.clone();
         let mut rng = crate::test_util::Rng::new(match lost {
@@ -178,16 +184,16 @@ impl Backend for MemBackend {
 }
 
 /// A file on disk that counts what is asked of it.
-pub(crate) struct Counting {
-    pub(crate) file: super::backend::FileBackend,
-    pub(crate) reads: std::sync::atomic::AtomicU64,
-    pub(crate) read_bytes: std::sync::atomic::AtomicU64,
-    pub(crate) writes: std::sync::atomic::AtomicU64,
-    pub(crate) written: std::sync::atomic::AtomicU64,
+pub struct Counting {
+    pub file: super::backend::FileBackend,
+    pub reads: std::sync::atomic::AtomicU64,
+    pub read_bytes: std::sync::atomic::AtomicU64,
+    pub writes: std::sync::atomic::AtomicU64,
+    pub written: std::sync::atomic::AtomicU64,
 }
 
 impl Counting {
-    pub(crate) fn open(path: &std::path::Path) -> Counting {
+    pub fn open(path: &std::path::Path) -> Counting {
         Counting {
             file: super::backend::FileBackend::open(path).unwrap(),
             reads: 0.into(),
@@ -198,7 +204,7 @@ impl Counting {
     }
 
     /// Reads, bytes read, writes and bytes written since the last call.
-    pub(crate) fn take(&self) -> [u64; 4] {
+    pub fn take(&self) -> [u64; 4] {
         use std::sync::atomic::Ordering::Relaxed;
         [
             self.reads.swap(0, Relaxed),
@@ -240,7 +246,7 @@ impl Backend for Counting {
 }
 
 /// A backend whose bytes can be taken as they would be after a crash.
-pub(crate) trait Imaged {
+pub trait Imaged {
     fn bytes(&self) -> Vec<u8>;
 }
 
