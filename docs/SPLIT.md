@@ -273,10 +273,16 @@ What `Setup::block` and `Setup::sign` take, sent as bytes:
 - the transactions, the sweeps, and the reward's output
 
 The prover needs nothing of the chain beyond the job. It does need, at
-startup, the proving setup and the table of the proof of work (a
-block's proof includes a proof of the work of the block before). Both
-take time to make ready, so a prover stays connected and is not
-started for each job.
+startup, the proving setup, which takes time to make ready: so a
+prover stays connected and is not started for each job.
+
+A block's proof includes a proof of the work of the block before, so
+the prover also reads items of the proof of work. *To confirm: that it
+can make the few it reads from the seed text, as a node does when it
+checks a header (`pow::SeedText::at`), and so needs no table. The
+reference hands it the miner's table because it has one. The table is
+1 GB on mainnet and doubles yearly to 32 GB, so this decides how much
+memory a prover's machine wants.*
 
 The witness has no encoding as bytes today. That is new code.
 
