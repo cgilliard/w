@@ -1,11 +1,28 @@
-//! Minimal data parallelism over scoped threads.
+//! Minimal data parallelism, over threads that stand.
 //!
 //! Work is split into contiguous ranges, one per thread, so the helpers
 //! suit loops whose iterations cost about the same. The thread count is
 //! `available_parallelism`, overridable with the `TABMINER_THREADS`
 //! environment variable; small inputs run on the calling thread.
+//!
+//! # The threads
+//!
+//! The threads are begun once, when a loop first wants them, and wait
+//! between loops: a proof runs tens of thousands of such loops, and
+//! does not begin and end as many threads for them. There is one fewer
+//! than the count, since whoever calls a helper works too: it takes the
+//! pieces of its own loop that no thread has yet begun, and then waits
+//! for the rest ([`run`]).
+//!
+//! So a loop within a loop is safe, and takes no more threads: the
+//! thread that runs the inner one works through it itself if every
+//! other is busy. A piece that panics does not end its thread; the
+//! panic is the caller's, when every piece has ended.
 
-use std::sync::OnceLock;
+use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 static THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -83,6 +100,147 @@ pub fn threads() -> usize {
     })
 }
 
+/// A piece of a loop: run once, on whichever thread takes it.
+type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+/// `f` as a piece of a loop: what it allocates is counted to the part
+/// whoever calls is working for ([`crate::heap::within`]).
+fn job<'a>(f: impl FnOnce() + Send + 'a) -> Job<'a> {
+    Box::new(crate::heap::within(f))
+}
+
+/// One call's pieces: how many have yet to end, the first panic among
+/// them, and whether all have ended, for the caller to wait on.
+struct Call {
+    left: AtomicUsize,
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    ended: Mutex<bool>,
+    woken: Condvar,
+}
+
+/// A piece waiting for a thread, and the call it is of.
+struct Waiting {
+    job: Job<'static>,
+    call: Arc<Call>,
+}
+
+impl Waiting {
+    /// Runs the piece; a panic in it is kept for the caller. The last
+    /// of a call's pieces to end says so.
+    fn run(self) {
+        let Waiting { job, call } = self;
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(job)) {
+            call.panic.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(panic);
+        }
+        if call.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *call.ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            call.woken.notify_all();
+        }
+    }
+}
+
+/// The pieces that wait, and the threads that take them.
+struct Standing {
+    waiting: Mutex<VecDeque<Waiting>>,
+    more: Condvar,
+}
+
+impl Standing {
+    /// A thread's life: the next piece, whenever there is one.
+    fn work(&self) {
+        loop {
+            let next = {
+                let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    match waiting.pop_front() {
+                        Some(next) => break next,
+                        None => waiting = self.more.wait(waiting).unwrap_or_else(|e| e.into_inner()),
+                    }
+                }
+            };
+            next.run();
+        }
+    }
+}
+
+/// The standing threads: begun when first asked for, one fewer than
+/// [`threads`], and never ended. (Fewer, if the system will not begin
+/// so many: whoever calls does what they would have.)
+fn standing() -> &'static Standing {
+    static STANDING: OnceLock<&'static Standing> = OnceLock::new();
+    STANDING.get_or_init(|| {
+        let standing: &'static Standing =
+            Box::leak(Box::new(Standing { waiting: Mutex::new(VecDeque::new()), more: Condvar::new() }));
+        for _ in 1..threads() {
+            let begun = std::thread::Builder::new().name("worker".into()).spawn(move || standing.work());
+            if begun.is_err() {
+                break;
+            }
+        }
+        standing
+    })
+}
+
+/// Runs every one of `jobs`, on the standing threads and on this one,
+/// and comes back when all have ended: with the panic of the first
+/// that panicked, if one did.
+///
+/// This thread takes those of its own that no thread has begun, and no
+/// others: so it is back as soon as its own are done, and a loop
+/// within a loop goes no deeper than the loops do.
+fn run<'a>(jobs: Vec<Job<'a>>) {
+    let mut jobs = jobs;
+    if jobs.len() <= 1 {
+        if let Some(only) = jobs.pop() {
+            only();
+        }
+        return;
+    }
+    let standing = standing();
+    let call = Arc::new(Call {
+        left: AtomicUsize::new(jobs.len()),
+        panic: Mutex::new(None),
+        ended: Mutex::new(false),
+        woken: Condvar::new(),
+    });
+    {
+        let mut waiting = standing.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs {
+            // SAFETY: a piece may borrow what is the caller's for `'a`,
+            // and is here said to borrow nothing. It is run, or dropped
+            // in its panic, before `call.left` is counted down for it
+            // ([`Waiting::run`]); and this function does not come back,
+            // by returning or by a panic, until `call.left` is nothing:
+            // between here and there it runs pieces, which catch their
+            // panics, and takes locks, which it takes whether or not
+            // they are poisoned. So no piece outlives `'a`.
+            let job = unsafe { std::mem::transmute::<Job<'a>, Job<'static>>(job) };
+            waiting.push_back(Waiting { job, call: Arc::clone(&call) });
+        }
+    }
+    standing.more.notify_all();
+    loop {
+        let own = {
+            let mut waiting = standing.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            let at = waiting.iter().position(|w| Arc::ptr_eq(&w.call, &call));
+            at.and_then(|at| waiting.remove(at))
+        };
+        match own {
+            Some(own) => own.run(),
+            None => break,
+        }
+    }
+    let mut ended = call.ended.lock().unwrap_or_else(|e| e.into_inner());
+    while !*ended {
+        ended = call.woken.wait(ended).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(ended);
+    let panic = call.panic.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(panic) = panic {
+        resume_unwind(panic);
+    }
+}
+
 /// Below this many items a loop runs serially.
 const MIN_PARALLEL: usize = 1024;
 
@@ -106,11 +264,8 @@ pub fn par_map_min<T: Send, F: Fn(usize) -> T + Sync>(n: usize, min_per_thread: 
         return (0..n).map(f).collect();
     }
     let f = &f;
-    let parts: Vec<Vec<T>> = std::thread::scope(|s| {
-        let handles: Vec<_> =
-            ranges.into_iter().map(|r| s.spawn(crate::heap::within(move || r.map(f).collect::<Vec<T>>()))).collect();
-        handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
-    });
+    let mut parts: Vec<Vec<T>> = ranges.iter().map(|_| Vec::new()).collect();
+    run(parts.iter_mut().zip(ranges).map(|(part, r)| job(move || *part = r.map(f).collect())).collect());
     let mut out = Vec::with_capacity(n);
     for p in parts {
         out.extend(p);
@@ -131,18 +286,14 @@ pub fn par_map_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T +
         return (0..n).map(|i| f(&mut state, i)).collect();
     }
     let (f, init) = (&f, &init);
-    let parts: Vec<Vec<T>> = std::thread::scope(|s| {
-        let handles: Vec<_> = ranges
-            .into_iter()
-            .map(|r| {
-                s.spawn(crate::heap::within(move || {
-                    let mut state = init();
-                    r.map(|i| f(&mut state, i)).collect::<Vec<T>>()
-                }))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
+    let mut parts: Vec<Vec<T>> = ranges.iter().map(|_| Vec::new()).collect();
+    let jobs = parts.iter_mut().zip(ranges).map(|(part, r)| {
+        job(move || {
+            let mut state = init();
+            *part = r.map(|i| f(&mut state, i)).collect();
+        })
     });
+    run(jobs.collect());
     let mut out = Vec::with_capacity(n);
     for p in parts {
         out.extend(p);
@@ -171,15 +322,14 @@ pub fn par_fill_min<T: Send, F: Fn(usize) -> T + Sync>(out: &mut [T], min_per_th
     // One contiguous run of `per` items per thread, the last one shorter.
     let per = n.div_ceil(t);
     let f = &f;
-    std::thread::scope(|s| {
-        for (k, run) in out.chunks_mut(per).enumerate() {
-            s.spawn(crate::heap::within(move || {
-                for (i, x) in run.iter_mut().enumerate() {
-                    *x = f(k * per + i);
-                }
-            }));
-        }
+    let jobs = out.chunks_mut(per).enumerate().map(|(k, items)| {
+        job(move || {
+            for (i, x) in items.iter_mut().enumerate() {
+                *x = f(k * per + i);
+            }
+        })
     });
+    run(jobs.collect());
 }
 
 /// Runs `f(chunk_index, chunk)` over `data.chunks_mut(chunk)` in parallel.
@@ -198,15 +348,14 @@ pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], ch
     // `per` chunks per thread, the last thread's run shorter.
     let per = n.div_ceil(t);
     let f = &f;
-    std::thread::scope(|s| {
-        for (k, run) in data.chunks_mut(per * chunk).enumerate() {
-            s.spawn(crate::heap::within(move || {
-                for (i, c) in run.chunks_mut(chunk).enumerate() {
-                    f(k * per + i, c);
-                }
-            }));
-        }
+    let jobs = data.chunks_mut(per * chunk).enumerate().map(|(k, chunks)| {
+        job(move || {
+            for (i, c) in chunks.chunks_mut(chunk).enumerate() {
+                f(k * per + i, c);
+            }
+        })
     });
+    run(jobs.collect());
 }
 
 /// Runs `f(chunk_index, a_chunk, b_chunk)` over the chunks of two slices
@@ -224,15 +373,14 @@ pub fn par_chunks2_mut<T: Send, F: Fn(usize, &mut [T], &mut [T]) + Sync>(a: &mut
     }
     let per = n.div_ceil(t);
     let f = &f;
-    std::thread::scope(|s| {
-        for (k, (ra, rb)) in a.chunks_mut(per * chunk).zip(b.chunks_mut(per * chunk)).enumerate() {
-            s.spawn(crate::heap::within(move || {
-                for (i, (x, y)) in ra.chunks_mut(chunk).zip(rb.chunks_mut(chunk)).enumerate() {
-                    f(k * per + i, x, y);
-                }
-            }));
-        }
+    let jobs = a.chunks_mut(per * chunk).zip(b.chunks_mut(per * chunk)).enumerate().map(|(k, (ra, rb))| {
+        job(move || {
+            for (i, (x, y)) in ra.chunks_mut(chunk).zip(rb.chunks_mut(chunk)).enumerate() {
+                f(k * per + i, x, y);
+            }
+        })
     });
+    run(jobs.collect());
 }
 
 /// `f` of each run of `run` items of `0..n`, in parallel, and the
@@ -264,19 +412,18 @@ where
     }
     let items = std::sync::Mutex::new(items);
     let (f, items) = (&f, &items);
-    std::thread::scope(|s| {
-        for _ in 0..threads() {
-            s.spawn(crate::heap::within(move || {
-                loop {
-                    let next = items.lock().unwrap_or_else(|e| e.into_inner()).next();
-                    match next {
-                        Some(x) => f(x),
-                        None => break,
-                    }
+    let jobs = (0..threads()).map(|_| {
+        job(move || {
+            loop {
+                let next = items.lock().unwrap_or_else(|e| e.into_inner()).next();
+                match next {
+                    Some(x) => f(x),
+                    None => break,
                 }
-            }));
-        }
+            }
+        })
     });
+    run(jobs.collect());
 }
 
 #[cfg(test)]
@@ -437,6 +584,102 @@ mod tests {
             }
         });
         assert!(v.iter().enumerate().all(|(i, x)| *x == i as u32));
+    }
+}
+
+#[cfg(test)]
+mod standing_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// A loop within a loop within a loop comes to its end, with every
+    /// thread there is already busy in the outer ones: whoever runs an
+    /// inner loop works through it.
+    #[test]
+    fn a_loop_within_a_loop_ends() {
+        let outer = 4 * threads();
+        let sums = par_map_min(outer, 1, |i| {
+            par_map_min(64, 1, |j| par_map_min(32, 1, |k| i * j + k).into_iter().sum::<usize>())
+                .into_iter()
+                .sum::<usize>()
+        });
+        let want: Vec<usize> =
+            (0..outer).map(|i| (0..64).map(|j| (0..32).map(|k| i * j + k).sum::<usize>()).sum()).collect();
+        assert_eq!(sums, want);
+    }
+
+    /// Many threads calling at once each get their own answers.
+    #[test]
+    fn callers_at_once_do_not_cross() {
+        std::thread::scope(|s| {
+            for t in 0..16usize {
+                s.spawn(move || {
+                    for round in 0..200 {
+                        let n = 3000 + 7 * t + round;
+                        let mut filled = vec![0usize; n];
+                        par_fill_min(&mut filled, 1, |i| i * t + round);
+                        assert!(filled.iter().enumerate().all(|(i, x)| *x == i * t + round));
+                        assert_eq!(par_fold(n, 100, 0, |r| r.sum::<usize>(), |a, b| a + b), n * (n - 1) / 2);
+                    }
+                });
+            }
+        });
+    }
+
+    /// The panic that reaches the caller is the piece's own, and comes
+    /// only when every other piece has ended; and the threads are there
+    /// for the next loop.
+    #[test]
+    fn a_panic_is_the_piece_s_own_and_ends_no_thread() {
+        let n = 16 * threads();
+        for _ in 0..20 {
+            let done = AtomicUsize::new(0);
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                par_map_min(n, 1, |i| {
+                    if i == n / 2 {
+                        panic!("piece {i} fails");
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                })
+            }));
+            let said = caught.expect_err("the panic reaches the caller");
+            assert_eq!(
+                said.downcast_ref::<String>().map(String::as_str),
+                Some(format!("piece {} fails", n / 2).as_str())
+            );
+            // Every piece but the one that panicked ran to where it
+            // could: all of them, but the rest of that one's run.
+            let per = n.div_ceil(threads().min(n));
+            assert!(done.load(Ordering::Relaxed) >= n - per);
+            assert_eq!(par_map_min(n, 1, |i| i + 1), (1..=n).collect::<Vec<_>>());
+        }
+    }
+
+    /// A piece works for the part its caller works for, whichever
+    /// thread takes it, and that thread is afterwards as it was.
+    #[test]
+    fn a_piece_is_of_its_caller_s_part() {
+        use crate::heap::{Part, enter, part};
+        for _ in 0..50 {
+            let in_wallet = enter(Part::Wallet);
+            assert!(par_map_min(8 * threads(), 1, |_| part()).into_iter().all(|p| p == Part::Wallet));
+            drop(in_wallet);
+            assert!(par_map_min(8 * threads(), 1, |_| part()).into_iter().all(|p| p == Part::Node));
+        }
+    }
+
+    /// The threads are begun once: a great many loops begin no more.
+    #[test]
+    fn loops_begin_no_threads() {
+        let _ = par_map_min(8, 1, |i| i);
+        let count = || std::fs::read_dir("/proc/self/task").map(|d| d.count()).ok();
+        let Some(before) = count() else { return };
+        for _ in 0..2000 {
+            let _ = par_map_min(4 * threads(), 1, |i| i);
+        }
+        // (Other tests begin and end threads of their own meanwhile:
+        // not two thousand of them.)
+        assert!(count().unwrap() < before + 1000);
     }
 }
 

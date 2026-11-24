@@ -591,10 +591,25 @@ six cores, in a copy of the reference with this allocator:
   proofs has tables of twice the size (8.2 GB at the most, by the
   reference's own measure); with more, it has not.
 
-Still to do in `shared` for the same end: threads that stand
-(`parallel.rs` begins 33,530 of them for that one block), and scratch
-space of a thread's own where a loop makes it afresh each time round
-(97,000 allocations of 64 KB to 1 MB, 7.5 GB in all).
+### Threads that stand: `parallel.rs`
+
+The reference begins threads for every loop it shares out, and ends
+them with it: 33,530 for that one block. Here they are begun once, one
+fewer than the count, and wait between loops; whoever calls a helper
+works too, on the pieces of its own loop that no thread has yet begun.
+A loop within a loop is safe, and a piece that panics ends no thread.
+No caller of the helpers is changed.
+
+The same block, the same way, with the threads standing:
+
+| | The reference | Threads standing | And the pool |
+|---|---|---|---|
+| Proving the block | 33 to 36 s | 29 to 31 s | 19 to 20 s |
+| Processor time in the system | 15 to 16 s | 11 to 12 s | 0.4 to 1.2 s |
+
+Still to do in `shared` for the same end: scratch space of a thread's
+own where a loop makes it afresh each time round (97,000 allocations
+of 64 KB to 1 MB for that block, 7.5 GB in all).
 
 ### Left for the node
 
