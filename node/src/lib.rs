@@ -11,6 +11,7 @@ pub mod chain;
 pub mod mempool;
 pub mod proving;
 pub mod store;
+pub mod transport;
 
 /// The library's own tests count the memory they hold, as the node
 /// does: for the tests that say how much a piece of work takes.

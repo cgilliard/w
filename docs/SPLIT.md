@@ -624,6 +624,9 @@ whole, at the most), and what it holds whole. A seed, about 95 MB; a
 public node, about 175 MB. What the node needs besides its pool has
 not been measured.
 
+Decided on 2026-11-25: it is left at that for now. A node of 256 MB
+can be borne, and the three ways down are there when one is wanted.
+
 To be tried when `net` is here: a burst of transactions through a
 line of nodes with small bins, counting what reaches the far end.
 
@@ -789,8 +792,8 @@ program.
 
 `node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
 `blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
-`leaves`, `receive`, `debug`), `proving`, and the pool (`mempool`):
-89 tests optimised, 6 ignored.
+`leaves`, `receive`, `debug`), `proving`, the pool (`mempool`), and
+`transport`: 126 tests optimised, 6 ignored.
 
 - What `tabshared` has is in the node under the names it has there
   (`pub use tabshared::*` at the crate's root), so that a file of the
@@ -819,10 +822,13 @@ program.
   `Mempool::knowing`), the older ones held whole by the lowest draws
   that fit so many bytes, and `Policy::holding` of two sizes and no
   share.
+- `transport` is the reference's: it needs nothing of the node but
+  `error` and `sha256`. Six places in its simulator are as Clippy
+  asks.
 
 ### Left for the node
 
-- `transport`, `net`, and what of `miner`, `configuration`,
+- `net`, and what of `miner`, `configuration`,
   `console` and `main` is the node's.
 
 ### Still to decide
