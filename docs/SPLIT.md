@@ -534,6 +534,72 @@ A review of the code for further enhancements, module by module, has
 not been done. It is better done at step 0, when the whole builds here
 and its tests run.
 
+### Decided: what a node holds of the pool
+
+Decided on 2026-11-25, and not yet built. The pool is brought over as
+the reference has it first; this is a change of its own after.
+
+What it is for:
+
+- A node that makes blocks holds every transaction whole.
+- Every other node passes transactions on, which it does in their
+  first moments, and keeps the rules of the pool as a miner does:
+  what is taken, what gives way, what is let go. It has a record of
+  every transaction for that, and not every transaction.
+- A seed is for finding other nodes by, and holds as little as may
+  be.
+
+| Node | Transactions known of | The newest, whole | Older ones, whole |
+|---|---|---|---|
+| Makes blocks (has a mining phrase) | 200,000, in 1 GB | all | all |
+| Public, makes none | 200,000, in 1 GB | 16 MB | 64 MB |
+| Seed | 200,000, in 1 GB | 16 MB | 0 |
+
+What changes from the reference:
+
+- **A most of transactions: 200,000**, for every node alike. The
+  reference bounds the pool by the transactions' sizes together
+  (1 GB) and by nothing else, so what a node keeps of records is
+  bounded by nothing it can set: 400,000 of the smallest. Reaching
+  the number is as reaching the size: what pays least gives way, and
+  the least taken rises. It is the same for all, as the size is, so
+  that every node takes and lets go alike. A full block is about
+  12,300 transactions of one input and two outputs, so this is 16
+  blocks waiting.
+- **A record is made small**: about a hundred bytes, where it is
+  nearer four hundred now with the tables beside it. Both are
+  reckoned and neither measured; it is to be measured first.
+- **The older ones held whole are so many bytes, and no share of a
+  hundred.** `--mempool-share` goes. The reference's 35% of 1 GB is
+  356 MB, and its cap 128 MB: so the share was 35% only while little
+  waited.
+- **Which of them, is by the lowest draws that fit.** A transaction's
+  draw is the hash of its id under the node's secret, as now. When
+  the older ones' space is full, one with a lower draw takes the
+  place of the highest held. The reference lets go every one that
+  comes while the space is full, whatever its draw: so a node holds
+  whatever came first, which is not a share at random.
+- **The newest held whole are 16 MB**, where they were 8. With full
+  blocks about 20 transactions come a second, each of 2.5 KB: 16 MB
+  is five minutes of that, and half a minute of ten times that.
+- **Which node holds all is by the mining phrase**, `--no-mine` being
+  gone: the three settings are a node's that has none.
+
+What stays:
+
+- A record whose transaction is not held is let go when what it
+  spends is spent, and is not brought back when a reorganization
+  undoes that. Whoever holds the transaction whole brings it back and
+  tells its peers, and it is taken from them as a new one is.
+
+What a node's pool then comes to, reckoned: 20 MB of records, about
+10 MB of the tables beside them (the ids of what expired, mostly),
+and what it holds whole. A seed, 46 MB; a public node, 110 MB. What
+the node needs besides its pool has not been measured.
+
+To be tried when `net` is here: a burst of transactions through a
+line of nodes with small bins, counting what reaches the far end.
+
 ## 11. Open questions
 
 1. **Names.** The two ports' numbers.
@@ -696,7 +762,8 @@ program.
 
 `node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
 `blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
-`leaves`, `receive`, `debug`), and `proving`: 73 tests, 4 ignored.
+`leaves`, `receive`, `debug`), `proving`, and the pool (`mempool`):
+88 tests optimised, 5 ignored.
 
 - What `tabshared` has is in the node under the names it has there
   (`pub use tabshared::*` at the crate's root), so that a file of the
@@ -716,10 +783,15 @@ program.
   with it, `test_util` and `store::testing` are seen from outside.
 - `hash::hash_domain` is public. The table of domain tags is not: the
   node's files use none of them now.
+- The pool is the reference's, less what a transaction pays and what
+  a node asks of one, which are `tabshared::fees` and are given out
+  again by the pool under the names they had (`mempool::Policy`,
+  `mempool::Weights`, and the rest). Four places are as Clippy asks.
+  What is decided of the pool's bins (section 10) is not in it yet.
 
 ### Left for the node
 
-- `mempool`, `transport`, `net`, and what of `miner`, `configuration`,
+- `transport`, `net`, and what of `miner`, `configuration`,
   `console` and `main` is the node's.
 
 ### Still to decide
