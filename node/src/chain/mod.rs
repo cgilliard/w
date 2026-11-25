@@ -406,8 +406,6 @@ impl<B: Backend + 'static> std::ops::Deref for StateRef<'_, B> {
 #[cfg(test)]
 impl<V> Chain<crate::store::testing::MemBackend, V> {
     /// How many times the store has been read from, for the tests.
-    /// (Not yet used here: the network's tests, which are to come, do.)
-    #[allow(dead_code)]
     pub(crate) fn store_reads(&self) -> u64 {
         match &*self.store() {
             Store::Whole(state) => state.file().backend().reads(),

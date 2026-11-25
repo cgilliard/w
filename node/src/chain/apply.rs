@@ -647,8 +647,6 @@ pub(crate) mod tests {
     /// The block after `chain`'s last making one output told apart by
     /// `tag`, not applied: as a miner hands one over. With `sound`
     /// false its state root is not what its body gives.
-    /// (Not yet used here: the network's tests, which are to come, do.)
-    #[allow(dead_code)]
     pub(crate) fn next_block<V: ProofVerifier + Sync>(chain: &Chain<MemBackend, V>, tag: u32, sound: bool) -> Vec<u8> {
         let body = body(&[], &[out(tag, PAY)]);
         block_with(chain, &body, if sound { None } else { Some(d(tag)) })
@@ -673,8 +671,7 @@ pub(crate) mod tests {
     }
 
     /// Extends `chain` by a block that makes `outputs`. The block,
-    /// whole. (Not yet used here: the network's tests, which are to come, do.)
-    #[allow(dead_code)]
+    /// whole.
     pub(crate) fn extend_with<V: ProofVerifier + Sync>(
         chain: &Chain<MemBackend, V>,
         outputs: &[BlockOutput],
@@ -684,7 +681,8 @@ pub(crate) mod tests {
 
     /// Extends `chain` by a block that spends the outputs at `spends`
     /// and makes `outputs`. The block, whole.
-    /// (Not yet used here: the network's tests, which are to come, do.)
+    /// (Used here only by the tests of [`crate::chain::debug`], which a
+    /// node built without `dev` has not.)
     #[allow(dead_code)]
     pub(crate) fn extend_spending<V: ProofVerifier + Sync>(
         chain: &Chain<MemBackend, V>,

@@ -792,8 +792,8 @@ program.
 
 `node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
 `blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
-`leaves`, `receive`, `debug`), `proving`, the pool (`mempool`), and
-`transport`: 126 tests optimised, 6 ignored.
+`leaves`, `receive`, `debug`), `proving`, the pool (`mempool`),
+`transport` and `net`: 240 tests optimised, 6 ignored.
 
 - What `tabshared` has is in the node under the names it has there
   (`pub use tabshared::*` at the crate's root), so that a file of the
@@ -825,11 +825,20 @@ program.
 - `transport` is the reference's: it needs nothing of the node but
   `error` and `sha256`. Six places in its simulator are as Clippy
   asks.
+- `net` is the reference's, whole: it needed nothing that was not
+  here already, and nothing of the wallet's files or the miner's.
+  Twenty-two places are as Clippy asks, or say why they are not. It
+  still holds the wallet's key on the message layer
+  (`sessions::Participant`, given by `Handle::participate`), as the
+  reference does: taking that out is section 7.3, and is not begun.
+- Its comments point to `docs/WIRE.md` and `docs/THREADS.md`, which
+  the reference has not got either.
 
 ### Left for the node
 
-- `net`, and what of `miner`, `configuration`,
-  `console` and `main` is the node's.
+- What of `miner`, `configuration`, `console` and `main` is the
+  node's.
+- Taking the wallet's key out of `net` (7.3).
 
 ### Still to decide
 
