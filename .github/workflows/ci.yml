@@ -1,0 +1,69 @@
+# Every check is scripts/ci.sh, which is run here as it is run on a
+# developer's machine: this file only says which checks, of which
+# crate, built for which processor.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to a branch stops the checks of the one before it.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The compiler every check is made with. Clippy gains lints with each
+  # release, so this is raised on purpose and not by the calendar.
+  RUST: "1.95.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.stage }} ${{ matrix.crate }} (${{ matrix.cpu }})
+    # A pull request from a branch of this repository has been checked
+    # already, when the branch was pushed.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [lint, debug, release]
+        crate: [shared, node]
+        # native: the runner's own processor, as .cargo/config.toml has
+        # it, with AVX2 and carry-less multiplication. x86-64: neither,
+        # so the code that does without them is run too.
+        cpu: [native, x86-64]
+        # The optimised tests are the long proofs, and without those
+        # instructions they take five times as long: over half an hour
+        # for the node on twelve threads, and a runner has four. The
+        # unoptimised tests run the same code on smaller proofs.
+        exclude:
+          - stage: release
+            cpu: x86-64
+    env:
+      RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The compiler
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST"
+          rustc --version --verbose
+
+      # Were a runner without AVX2 to build "native", both builds would
+      # be of the same code and nothing would say so.
+      - name: Which code is built
+        run: |
+          has=$(rustc --print cfg $RUSTFLAGS | grep -E '^target_feature="(avx2|pclmulqdq)"$' || true)
+          echo "${has:-neither avx2 nor pclmulqdq}"
+          test "$(printf '%s' "$has" | grep -c .)" = "${{ matrix.cpu == 'native' && '2' || '0' }}"
+
+      - name: ${{ matrix.stage }}
+        run: scripts/ci.sh ${{ matrix.stage }} ${{ matrix.crate }}

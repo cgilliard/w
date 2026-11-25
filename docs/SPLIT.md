@@ -71,6 +71,35 @@ The shared library exists (`shared/`): section 12 says what is in it
 and how it differs from the reference. The workspace does not yet:
 each crate is built on its own for now.
 
+### The checks
+
+`scripts/ci.sh` makes them, and `.github/workflows/ci.yml` runs that
+script on every push, so a check is the same on a developer's machine
+as it is there. For each crate that has code:
+
+- **lint**: `Cargo.lock` names no package from outside the repository;
+  `cargo fmt --check`; Clippy, with warnings as errors, once for each
+  set of the crate's features.
+- **debug**: the tests unoptimised, with the checks for overflow and
+  the debug assertions. The tests marked "slow unoptimized" are left
+  out.
+- **release**: the tests optimised, those included.
+
+CI makes lint and debug twice: built for the runner's own processor
+(`target-cpu=native`, as `.cargo/config.toml` has it), and built for
+any x86-64 (`target-cpu=x86-64`). The second is the only place the
+Blake3 without AVX2 and the field's multiplication without `pclmulqdq`
+are run by a machine that has both. Release is made for the runner's
+own processor alone: for any x86-64 the node's optimised tests took 31
+minutes on twelve threads, against 5 and a half. The compiler is fixed
+in the workflow (1.95.0), to be raised on purpose.
+
+The optimised tests of `shared` held 9.2 GB at the most on twelve
+threads, and the node's 7.9 GB: a machine with less than that free has
+them killed, as happened here. A runner has 16 GB and four threads.
+
+A crate is added to both files when it has code.
+
 ## 3. Which module goes where
 
 ### `tabshared`, the shared library
