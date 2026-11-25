@@ -536,8 +536,10 @@ and its tests run.
 
 ### Decided: what a node holds of the pool
 
-Decided on 2026-11-25, and not yet built. The pool is brought over as
-the reference has it first; this is a change of its own after.
+Decided on 2026-11-25. The pool was brought over as the reference has
+it first, and this is a change of its own after. Built, but for two
+things: the settings (`configuration` is not here yet), and a record
+as small as was hoped, which is at the end of this.
 
 What it is for:
 
@@ -566,9 +568,7 @@ What changes from the reference:
   that every node takes and lets go alike. A full block is about
   12,300 transactions of one input and two outputs, so this is 16
   blocks waiting.
-- **A record is made small**: about a hundred bytes, where it is
-  nearer four hundred now with the tables beside it. Both are
-  reckoned and neither measured; it is to be measured first.
+- **A record is made smaller**, and is not yet small: see below.
 - **The older ones held whole are so many bytes, and no share of a
   hundred.** `--mempool-share` goes. The reference's 35% of 1 GB is
   356 MB, and its cap 128 MB: so the share was 35% only while little
@@ -592,10 +592,37 @@ What stays:
   undoes that. Whoever holds the transaction whole brings it back and
   tells its peers, and it is taken from them as a new one is.
 
-What a node's pool then comes to, reckoned: 20 MB of records, about
-10 MB of the tables beside them (the ids of what expired, mostly),
-and what it holds whole. A seed, 46 MB; a public node, 110 MB. What
-the node needs besides its pool has not been measured.
+What a record weighs, measured (`mempool::tests::what_a_record_weighs`:
+25,000 transactions of one input, none held whole, and what the pool
+then has of the heap):
+
+| | A record, with the tables beside it | 200,000 of them |
+|---|---|---|
+| As the reference has it | 421 bytes | 84 MB |
+| As it is now | 347 bytes | 69 MB |
+
+"About a hundred bytes", which is what was hoped for when 200,000 was
+chosen, was wrong. The record itself went from 152 bytes to 120 (the
+positions it spends are in it where there is one; its size is four
+bytes; what it has on the heap, it has without room to grow). The
+rest is the tables, which have a transaction's id of 32 bytes three
+times over: the table of records by id (200 bytes a record, the
+record in it), the table of who spends a position (54), and the order
+by age (96: a tree filled in order is left half empty).
+
+What would bring it down further, reckoned and not measured:
+
+- The records in rows of their own, and the tables holding a row's
+  number of four bytes and not an id: about 235 bytes, 47 MB.
+- And a table by id made here for that, which the standard library's
+  is not: about 195 bytes, 39 MB.
+- Or half as many transactions known of.
+
+So what a node's pool comes to as it is now: 69 MB of records, up to
+5 MB of the ids of what expired, the shelf (a quarter of what it holds
+whole, at the most), and what it holds whole. A seed, about 95 MB; a
+public node, about 175 MB. What the node needs besides its pool has
+not been measured.
 
 To be tried when `net` is here: a burst of transactions through a
 line of nodes with small bins, counting what reaches the far end.
@@ -763,7 +790,7 @@ program.
 `node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
 `blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
 `leaves`, `receive`, `debug`), `proving`, and the pool (`mempool`):
-88 tests optimised, 5 ignored.
+89 tests optimised, 6 ignored.
 
 - What `tabshared` has is in the node under the names it has there
   (`pub use tabshared::*` at the crate's root), so that a file of the
@@ -787,7 +814,11 @@ program.
   a node asks of one, which are `tabshared::fees` and are given out
   again by the pool under the names they had (`mempool::Policy`,
   `mempool::Weights`, and the rest). Four places are as Clippy asks.
-  What is decided of the pool's bins (section 10) is not in it yet.
+  What a node holds of it is as section 10 says, which is not the
+  reference's: a most of transactions (`DEFAULT_COUNT`,
+  `Mempool::knowing`), the older ones held whole by the lowest draws
+  that fit so many bytes, and `Policy::holding` of two sizes and no
+  share.
 
 ### Left for the node
 

@@ -58,7 +58,7 @@
 //! asks through a [`Ledger`], which a snapshot of the state is; and the
 //! time is given to it, so that nothing here reads a clock.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::error::Error;
 use crate::fees::MAX_BLOCK_SIZE;
@@ -68,7 +68,7 @@ use crate::fees::MAX_BLOCK_SIZE;
 pub use crate::fees::{
     DUST, EXPIRY_SECS, HALF_LIFE_SECS, MAX_TX_SIZE, MIN_FEE_PER_UNIT, PROOF_BYTES, PROTECT_BYTES, Policy,
     REPLACEMENT_FEE_PER_UNIT, RESERVE_BYTES, RESERVE_PERCENT, TARGET_BLOCK, TARGET_DAY, TARGET_HOUR, WHOLE_OLDER,
-    WHOLE_OLDER_PERCENT, WHOLE_RECENT, Weights, reserve_bytes,
+    WHOLE_RECENT, Weights, reserve_bytes,
 };
 use crate::hash::Digest;
 use crate::name::{Key, MAX_REVEAL, MAX_SWEEPS, NameOp, OpKind, Record, commit_hash, count_ops, in_window};
@@ -155,6 +155,13 @@ pub enum Claim {
 
 /// Default pool capacity in bytes.
 pub const DEFAULT_CAPACITY: usize = 1 << 30;
+/// The most transactions a pool knows of, by default, whatever their
+/// bytes: what a node keeps of each is bounded by this and by nothing
+/// else, a transaction held whole or not. Every node's the same, as
+/// the capacity is, so that every node takes and lets go alike. A full
+/// block is some 12,300 transactions of one input and two outputs:
+/// this is sixteen blocks waiting.
+pub const DEFAULT_COUNT: usize = 200_000;
 /// Shelved transactions kept, at most.
 const SHELF: usize = 1024;
 /// And, by their size, no more than this part of the pool's capacity.
@@ -255,6 +262,30 @@ impl core::fmt::Display for Reject {
     }
 }
 
+/// The positions of the outputs a transaction spends: one, of most
+/// transactions, which is kept in the record itself; or more.
+#[derive(Clone, Debug)]
+enum Spent {
+    One(u64),
+    Many(Box<[u64]>),
+}
+
+impl Spent {
+    fn of(positions: Vec<u64>) -> Spent {
+        match positions[..] {
+            [one] => Spent::One(one),
+            _ => Spent::Many(positions.into_boxed_slice()),
+        }
+    }
+
+    fn all(&self) -> &[u64] {
+        match self {
+            Spent::One(position) => std::slice::from_ref(position),
+            Spent::Many(positions) => positions,
+        }
+    }
+}
+
 /// A pooled transaction: held whole; or only known of, by what a node
 /// that makes no blocks needs of it (its id, its size and what it
 /// pays, when it came, what it spends and what names it claims).
@@ -273,13 +304,13 @@ impl core::fmt::Display for Reject {
 pub struct Entry {
     /// Its encoding: a transaction, checked when it was pooled. Empty,
     /// of one only known of.
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
     /// Its size, in bytes, whole or not.
-    size: usize,
-    /// The positions of the outputs it spends.
-    spent: Vec<u64>,
+    size: u32,
     /// Whether it is among the most recent, which are all held whole.
     recent: bool,
+    /// The positions of the outputs it spends.
+    spent: Spent,
     pub txid: Digest,
     pub fee: u64,
     /// What it weighs, by the pool's policy ([`Weights`]).
@@ -291,7 +322,7 @@ pub struct Entry {
     /// breaker, arrival times being whole seconds.
     pub order: u64,
     /// What its name operations claim.
-    pub claims: Vec<Claim>,
+    pub claims: Box<[Claim]>,
 }
 
 impl Entry {
@@ -315,12 +346,12 @@ impl Entry {
 
     /// Its size, in bytes, held whole or not.
     pub fn size(&self) -> usize {
-        self.size
+        self.size as usize
     }
 
     /// The positions of the outputs it spends.
     pub fn spent(&self) -> &[u64] {
-        &self.spent
+        self.spent.all()
     }
 
     /// Fee per unit of weight, scaled by 2^16 for integer comparison.
@@ -352,6 +383,8 @@ pub struct Mempool {
     claims: HashMap<Claim, Digest>,
     bytes: usize,
     capacity: usize,
+    /// The most transactions known of ([`DEFAULT_COUNT`]).
+    most: usize,
     /// Transactions dropped for spent inputs, oldest first, in case a
     /// reorganization brings their inputs back.
     shelf: Vec<Entry>,
@@ -382,6 +415,10 @@ pub struct Mempool {
     /// newer ones have pushed it out. (An id that is here and no
     /// longer among them is passed over.)
     recent: VecDeque<Digest>,
+    /// The older ones held whole, each by its draw
+    /// ([`Mempool::draw`]): the highest is the first let go. (Empty,
+    /// of a pool that holds everything.)
+    older: BTreeSet<(u64, Digest)>,
     /// What says which of the older ones this node holds whole: a
     /// secret of its own, taken when the pool is made.
     secret: [u8; 32],
@@ -508,6 +545,7 @@ impl Mempool {
             claims: HashMap::new(),
             bytes: 0,
             capacity,
+            most: DEFAULT_COUNT,
             shelf: Vec::new(),
             policy,
             expired: HashMap::new(),
@@ -521,6 +559,7 @@ impl Mempool {
             recent_bytes: 0,
             older_bytes: 0,
             recent: VecDeque::new(),
+            older: BTreeSet::new(),
             // (Chance, where there is any to be had; and without it a
             // share all the same, which is what matters.)
             secret: {
@@ -529,6 +568,17 @@ impl Mempool {
                 secret
             },
         }
+    }
+
+    /// The same pool, knowing of `count` transactions at the most.
+    pub fn knowing(mut self, count: usize) -> Mempool {
+        self.most = count;
+        self
+    }
+
+    /// The most transactions the pool knows of.
+    pub fn most(&self) -> usize {
+        self.most
     }
 
     /// The bytes of the transactions held whole.
@@ -541,37 +591,71 @@ impl Mempool {
         self.txs.values().filter(|e| e.whole()).count()
     }
 
-    /// Whether this node holds the transaction `txid` whole once it is
-    /// no longer among the most recent: its share of the older ones,
-    /// by a hash of the id under the node's own secret. The same
-    /// answer each time, with nothing to keep; and nobody else's.
-    fn keeps(&self, txid: &Digest) -> bool {
-        if self.policy.whole_older_percent >= 100 {
-            return true;
-        }
-        let mut both = self.secret.to_vec();
-        both.extend_from_slice(&crate::hash::digest_to_bytes(txid));
+    /// A transaction's draw: a hash of its id under the node's own
+    /// secret. Of the older ones a node holds whole those of the
+    /// lowest draws that fit, so what it holds is a share of them at
+    /// random, however many there are: the same each time it is asked,
+    /// with nothing to keep; each node's its own; and nobody else can
+    /// tell or arrange which a node holds.
+    fn draw(&self, txid: &Digest) -> u64 {
+        let mut both = [0u8; 64];
+        both[..32].copy_from_slice(&self.secret);
+        both[32..].copy_from_slice(&crate::hash::digest_to_bytes(txid));
         let hash = crate::sha256::sha256(&both);
-        let drawn = u64::from_le_bytes(hash[..8].try_into().expect("eight bytes")) % 100;
-        (drawn as usize) < self.policy.whole_older_percent
+        u64::from_le_bytes(hash[..8].try_into().expect("eight bytes"))
+    }
+
+    /// Makes room among the older ones held whole for one of `size`
+    /// whose place among them is `place` (its draw, and its id): by
+    /// letting go those after it, the last first, if that is room
+    /// enough. Those are only known of from here on. Says whether
+    /// there is room: where there is not, nothing is let go.
+    fn older_room(&mut self, place: (u64, Digest), size: usize) -> bool {
+        let mut room = self.policy.whole_older.saturating_sub(self.older_bytes);
+        let mut out = Vec::new();
+        for other in self.older.iter().rev() {
+            if room >= size || *other < place {
+                break;
+            }
+            room += self.txs[&other.1].size();
+            out.push(*other);
+        }
+        if room < size {
+            return false;
+        }
+        for other in out {
+            self.older.remove(&other);
+            let e = self.txs.get_mut(&other.1).expect("what is held is known of");
+            e.bytes = Box::default();
+            self.held -= e.size();
+            self.older_bytes -= e.size();
+        }
+        true
     }
 
     /// Lets the oldest of the most recent go from among them while
     /// they are more than is held whole of those: each is held whole
-    /// still, if it is of this node's share of the older ones and
-    /// there is room among them; or is only known of from here on.
+    /// still, if its draw is among the lowest of the older ones that
+    /// fit their room; or is only known of from here on.
     fn age(&mut self) {
         while self.recent_bytes > self.policy.whole_recent {
             let Some(id) = self.recent.pop_front() else { break };
-            let keeps = self.keeps(&id);
             let Some(e) = self.txs.get_mut(&id).filter(|e| e.recent) else { continue };
             e.recent = false;
-            self.recent_bytes -= e.size;
-            if keeps && self.older_bytes.saturating_add(e.size) <= self.policy.whole_older {
-                self.older_bytes += e.size;
+            let size = e.size();
+            self.recent_bytes -= size;
+            // (A pool that holds everything keeps no draws.)
+            if self.policy.holds_all() {
+                self.older_bytes += size;
+                continue;
+            }
+            let place = (self.draw(&id), id);
+            if self.older_room(place, size) {
+                self.older.insert(place);
+                self.older_bytes += size;
             } else {
-                self.held -= e.size;
-                e.bytes = Vec::new();
+                self.held -= size;
+                self.txs.get_mut(&id).expect("looked up above").bytes = Box::default();
             }
         }
     }
@@ -590,9 +674,11 @@ impl Mempool {
             return floor;
         }
         let mut half_life = self.policy.half_life_secs as f64;
-        if self.bytes < self.capacity / 4 {
+        // (How full, by its bytes or by how many it knows of.)
+        let under = |part: usize| self.bytes < self.capacity / part && self.txs.len().saturating_mul(part) < self.most;
+        if under(4) {
             half_life /= 4.0;
-        } else if self.bytes < self.capacity / 2 {
+        } else if under(2) {
             half_life /= 2.0;
         }
         let elapsed = now.saturating_sub(self.rolling_at) as f64;
@@ -620,7 +706,8 @@ impl Mempool {
     }
 
     /// The bytes kept from eviction: [`Policy::protect_bytes`], at most
-    /// half the pool.
+    /// half the pool. (And no more transactions than half of those it
+    /// knows of at the most: [`Mempool::protected_until`].)
     fn protect_budget(&self) -> usize {
         self.policy.protect_bytes.min(self.capacity / 2)
     }
@@ -631,7 +718,7 @@ impl Mempool {
         let budget = self.protect_budget();
         let mut used = 0;
         let mut last = None;
-        for (key, id) in &self.by_age {
+        for (key, id) in self.by_age.iter().take(self.most / 2) {
             used += self.txs[id].size();
             if used > budget {
                 break;
@@ -646,13 +733,13 @@ impl Mempool {
     fn would_protect(&self, key: (u64, u64), size: usize) -> bool {
         let budget = self.protect_budget();
         let mut used = size;
-        for id in self.by_age.range(..key).map(|(_, id)| id) {
+        for (before, id) in self.by_age.range(..key).map(|(_, id)| id).enumerate() {
             used += self.txs[id].size();
-            if used > budget {
+            if used > budget || before + 1 >= self.most / 2 {
                 return false;
             }
         }
-        used <= budget
+        used <= budget && self.most >= 2
     }
 
     /// Whether a pooled transaction is kept from eviction: one of the aged
@@ -876,7 +963,8 @@ impl Mempool {
     ) -> Result<Digest, Reject> {
         let _in = crate::heap::enter(crate::heap::Part::Pool);
         // (Before it is read at all: what is too large is not read.)
-        if bytes.len() > self.policy.max_tx_size {
+        // (Nor what is larger than a record says the size of.)
+        if bytes.len() > self.policy.max_tx_size || u32::try_from(bytes.len()).is_err() {
             return Err(Reject::TooLarge(bytes.len()));
         }
         let tx = TransactionRef::from_bytes(bytes).map_err(|_| Reject::Malformed)?;
@@ -933,9 +1021,18 @@ impl Mempool {
         }
         tx.check_policy_inputs(height, |p| made_at(ledger, p)).map_err(Reject::Policy)?;
         self.next_order += 1;
-        let spent: Vec<u64> = tx.spent_positions().collect();
-        let entry =
-            Entry { bytes: bytes.to_vec(), size, spent, recent: false, txid, fee, weight, arrived, order, claims };
+        let entry = Entry {
+            bytes: bytes.into(),
+            size: size as u32,
+            recent: false,
+            spent: Spent::of(tx.spent_positions().collect()),
+            txid,
+            fee,
+            weight,
+            arrived,
+            order,
+            claims: claims.into_boxed_slice(),
+        };
         // Replaced transactions go first, so their room counts; they are
         // put back if the new one still does not fit.
         let removed: Vec<Entry> = conflicts.iter().filter_map(|id| self.remove(id)).collect();
@@ -952,11 +1049,13 @@ impl Mempool {
     /// Evicts the lowest-rate transactions but the protected until one of
     /// `size` fits, raising the rolling minimum past each, or refuses if
     /// it pays (at `paying`, a scaled rate) less than what it would evict.
+    /// It fits when the pool has the bytes for it, and knows of fewer
+    /// than the most it may.
     fn make_room(&mut self, size: usize, paying: u128, now: u64) -> Result<(), Reject> {
-        if size > self.capacity {
+        if size > self.capacity || self.most == 0 {
             return Err(Reject::Full);
         }
-        if self.bytes + size <= self.capacity {
+        if self.bytes + size <= self.capacity && self.txs.len() < self.most {
             return Ok(());
         }
         // Evicting the unprotected, all younger than the protected, leaves
@@ -965,18 +1064,20 @@ impl Mempool {
         let mut victims: Vec<&Entry> = self.txs.values().filter(|e| until.is_none_or(|u| e.age_key() > u)).collect();
         victims.sort_unstable_by_key(|e| (e.rate(), std::cmp::Reverse(e.age_key())));
         let mut room = self.capacity - self.bytes;
+        let mut known = self.txs.len();
         let mut evict = Vec::new();
         for v in victims {
-            if room >= size {
+            if room >= size && known < self.most {
                 break;
             }
             if v.rate() >= paying {
                 return Err(Reject::Full);
             }
             room += v.size();
+            known -= 1;
             evict.push((v.txid, v.rate()));
         }
-        if room < size {
+        if room < size || known >= self.most {
             return Err(Reject::Full);
         }
         self.settle(now);
@@ -988,10 +1089,10 @@ impl Mempool {
     }
 
     fn add(&mut self, mut entry: Entry) {
-        for p in &entry.spent {
+        for p in entry.spent() {
             self.spends.insert(*p, entry.txid);
         }
-        for c in &entry.claims {
+        for c in entry.claims.iter() {
             self.claims.insert(*c, entry.txid);
         }
         self.bytes += entry.size();
@@ -999,8 +1100,8 @@ impl Mempool {
         // oldest of those may be so no longer.)
         entry.recent = entry.whole();
         if entry.recent {
-            self.held += entry.size;
-            self.recent_bytes += entry.size;
+            self.held += entry.size();
+            self.recent_bytes += entry.size();
             self.recent.push_back(entry.txid);
         }
         self.by_age.insert(entry.age_key(), entry.txid);
@@ -1011,16 +1112,23 @@ impl Mempool {
     /// Removes a transaction; returns it if it was pooled.
     pub fn remove(&mut self, txid: &Digest) -> Option<Entry> {
         let entry = self.txs.remove(txid)?;
-        for p in &entry.spent {
+        for p in entry.spent() {
             self.spends.remove(p);
         }
-        for c in &entry.claims {
+        for c in entry.claims.iter() {
             self.claims.remove(c);
         }
         self.bytes -= entry.size();
         match (entry.whole(), entry.recent) {
-            (true, true) => (self.held, self.recent_bytes) = (self.held - entry.size, self.recent_bytes - entry.size),
-            (true, false) => (self.held, self.older_bytes) = (self.held - entry.size, self.older_bytes - entry.size),
+            (true, true) => {
+                (self.held, self.recent_bytes) = (self.held - entry.size(), self.recent_bytes - entry.size())
+            }
+            (true, false) => {
+                (self.held, self.older_bytes) = (self.held - entry.size(), self.older_bytes - entry.size());
+                if !self.policy.holds_all() {
+                    self.older.remove(&(self.draw(txid), *txid));
+                }
+            }
             (false, _) => {}
         }
         self.by_age.remove(&entry.age_key());
@@ -1053,7 +1161,7 @@ impl Mempool {
             // unspent, which is all that can be told of it. (In a
             // block, or spent by another that is.)
             let Some(tx) = e.tx() else {
-                for p in &e.spent {
+                for p in e.spent() {
                     if !ledger.output(*p)?.is_some_and(|(_, _, unspent)| unspent) {
                         gone.push(e.txid);
                         break;

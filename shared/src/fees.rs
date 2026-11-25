@@ -22,14 +22,16 @@ use crate::transaction::TransactionRef;
 pub const MAX_TX_SIZE: usize = 2 << 20;
 
 /// Of the transactions known, the most recent held whole: this many
-/// bytes of them, unless said otherwise.
-pub const WHOLE_RECENT: usize = 8 << 20;
+/// bytes of them, unless said otherwise. A transaction is passed on in
+/// its first moments, so this is what a node needs to pass them on.
+/// With full blocks about twenty come a second, of 2.5 KB each: this
+/// is five minutes of that, and half a minute of ten times that.
+pub const WHOLE_RECENT: usize = 16 << 20;
 
-/// Of the older ones, the share held whole (of a hundred), in no more
-/// than so many bytes, unless said otherwise.
-pub const WHOLE_OLDER_PERCENT: usize = 35;
-
-pub const WHOLE_OLDER: usize = 128 << 20;
+/// Of the older ones, the bytes held whole, unless said otherwise: for
+/// whoever makes blocks and comes late. None is needed of a node for
+/// the rest to go on, and a seed holds none.
+pub const WHOLE_OLDER: usize = 64 << 20;
 
 /// Base units a unit of weight ([`Weights`]) that a transaction must pay
 /// to be pooled at all, by default: so that relaying a signature, and
@@ -177,12 +179,11 @@ pub struct Policy {
     /// The largest transaction pooled and relayed, in bytes.
     pub max_tx_size: usize,
     /// How much of what the pool knows of it holds whole: the most
-    /// recent, so many bytes of them; and of the older ones a share
-    /// (of a hundred), in no more than so many bytes. Of the rest it
-    /// keeps what a node that makes no blocks needs of a transaction,
-    /// and not the transaction. A node that makes blocks holds all.
+    /// recent, so many bytes of them; and of the older ones, so many
+    /// bytes. Of the rest it keeps what a node that makes no blocks
+    /// needs of a transaction, and not the transaction. A node that
+    /// makes blocks holds all.
     pub whole_recent: usize,
-    pub whole_older_percent: usize,
     pub whole_older: usize,
 }
 
@@ -198,7 +199,6 @@ impl Policy {
         reserve_percent: RESERVE_PERCENT,
         max_tx_size: MAX_TX_SIZE,
         whole_recent: WHOLE_RECENT,
-        whole_older_percent: WHOLE_OLDER_PERCENT,
         whole_older: WHOLE_OLDER,
     };
     /// Anything valid, for tests.
@@ -215,16 +215,21 @@ impl Policy {
     }
 
     /// The same policy, holding whole so much of what the pool knows
-    /// of: `recent` bytes of the most recent, and `percent` of the
-    /// older ones in no more than `older` bytes.
-    pub const fn holding(self, recent: usize, percent: usize, older: usize) -> Policy {
-        Policy { whole_recent: recent, whole_older_percent: percent, whole_older: older, ..self }
+    /// of: `recent` bytes of the most recent, and `older` bytes of the
+    /// older ones.
+    pub const fn holding(self, recent: usize, older: usize) -> Policy {
+        Policy { whole_recent: recent, whole_older: older, ..self }
     }
 
     /// The same policy, holding everything whole: as a node that makes
     /// blocks does.
     pub const fn holding_all(self) -> Policy {
-        self.holding(usize::MAX, 100, usize::MAX)
+        self.holding(usize::MAX, usize::MAX)
+    }
+
+    /// Whether everything is held whole.
+    pub const fn holds_all(&self) -> bool {
+        self.whole_older == usize::MAX
     }
 
     /// The same policy with other weights, its dust limit following.
@@ -309,9 +314,10 @@ mod tests {
             (reserve_bytes(MAX_BLOCK_SIZE, RESERVE_PERCENT), RESERVE_BYTES * a_day)
         );
         // What it holds whole, and how large a transaction it takes.
-        let held = Policy::MAINNET.holding(1, 2, 3).with_max_tx_size(4);
-        assert_eq!((held.whole_recent, held.whole_older_percent, held.whole_older, held.max_tx_size), (1, 2, 3, 4));
+        let held = Policy::MAINNET.holding(1, 3).with_max_tx_size(4);
+        assert_eq!((held.whole_recent, held.whole_older, held.max_tx_size, held.holds_all()), (1, 3, 4, false));
+        assert_eq!((Policy::MAINNET.whole_recent, Policy::MAINNET.whole_older), (16 << 20, 64 << 20));
         let all = Policy::MAINNET.holding_all();
-        assert_eq!((all.whole_recent, all.whole_older_percent, all.whole_older), (usize::MAX, 100, usize::MAX));
+        assert_eq!((all.whole_recent, all.whole_older, all.holds_all()), (usize::MAX, usize::MAX, true));
     }
 }

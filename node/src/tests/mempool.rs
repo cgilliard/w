@@ -81,8 +81,9 @@ fn none() -> (HashMap<Commitment, Vec<u64>>, HashMap<Commitment, u64>) {
 }
 
 /// A node that makes no blocks holds whole the most recent of what
-/// its pool knows of, and of the older ones a share that is its own;
-/// of the rest it keeps what they spend and pay. What is only known
+/// its pool knows of, and of the older ones as many as fit the room it
+/// gives them, which are its own: those its secret draws lowest,
+/// whichever came first. Of the rest it keeps what they spend and pay. What is only known
 /// of still keeps another from spending the same, counts towards what
 /// the pool holds, and goes when a block spends what it spends; it is
 /// not given to whoever asks, not put in a block, and not kept from
@@ -97,24 +98,27 @@ fn of_what_is_known_some_is_held_whole() {
         })
         .collect();
     let size = txs[0].len();
-    // The four most recent, and a share of the older: none; half; all.
-    for percent in [0usize, 50, 100] {
-        let policy = Policy::NONE.holding(4 * size, percent, usize::MAX);
+    // The four most recent, and of the older: none; room for half; all.
+    for room in [0usize, 18, usize::MAX] {
+        let policy = Policy::NONE.holding(4 * size, room.saturating_mul(size));
         let mut pool = Mempool::with_policy(1 << 30, policy);
         let ids: Vec<Digest> = txs.iter().map(|tx| pool.insert(tx, &state, 1, 10).unwrap()).collect();
         // All are known, and count as before.
         assert_eq!((pool.len(), pool.bytes()), (40, 40 * size));
         let whole: Vec<bool> = ids.iter().map(|id| pool.entry(id).unwrap().whole()).collect();
-        // The last four are whole, whatever the share.
-        assert!(whole[36..].iter().all(|w| *w), "{percent}");
+        // The last four are whole, whatever the room.
+        assert!(whole[36..].iter().all(|w| *w), "{room}");
         let older = whole[..36].iter().filter(|w| **w).count();
-        match percent {
-            0 => assert_eq!(older, 0),
-            100 => assert_eq!(older, 36),
-            // (Half of thirty-six by a hash: not none, and not all.)
-            _ => assert!((6..=30).contains(&older), "{older}"),
-        }
+        assert_eq!(older, room.min(36), "{room}");
         assert_eq!((pool.whole(), pool.held()), (4 + older, (4 + older) * size));
+        // Which of the older, where they are not all: those of the
+        // lowest draws, and no other.
+        if room == 18 {
+            let draws =
+                |is: bool| ids[..36].iter().zip(&whole).filter(move |(_, w)| **w == is).map(|(id, _)| pool.draw(id));
+            assert!(draws(true).max() < draws(false).min());
+            assert_eq!((pool.older.len(), pool.older_bytes), (18, 18 * size));
+        }
         // What is whole is given and what is not is not; either way it
         // is known, with what it is and pays.
         for (id, is) in ids.iter().zip(&whole) {
@@ -134,7 +138,7 @@ fn of_what_is_known_some_is_held_whole() {
         assert!(!pool.contains(&first) && pool.entry(&better).unwrap().whole());
         // A block is made of what is whole.
         let chosen = pool.select(&state, 1, 1, 0, |_| true);
-        assert_eq!(chosen.len(), pool.whole(), "{percent}");
+        assert_eq!(chosen.len(), pool.whole(), "{room}");
         // Kept from one run to the next: what is whole.
         let mut again = Mempool::with_policy(1 << 30, Policy::NONE.holding_all());
         assert_eq!(again.load(&pool.saved(), &state, 1, 12), pool.whole());
@@ -152,23 +156,97 @@ fn of_what_is_known_some_is_held_whole() {
             pool.remove(&id);
         }
         assert_eq!((pool.len(), pool.bytes(), pool.held(), pool.whole()), (0, 0, 0, 0));
+        assert_eq!((pool.older.len(), pool.older_bytes, pool.recent_bytes), (0, 0, 0));
     }
-    // The older ones held whole are no more than they may be: a share
-    // of all, in room for two.
-    let mut pool = Mempool::with_policy(1 << 30, Policy::NONE.holding(4 * size, 100, 2 * size));
-    for tx in &txs {
+    // Two nodes hold different ones: each its own. And a node holds
+    // the same ones in whatever order they came: so that what it holds
+    // is no more of what came first, when there is no room for all.
+    let share = |seed: u8, backwards: bool| {
+        let mut pool = Mempool::with_policy(1 << 30, Policy::NONE.holding(0, 18 * size));
+        pool.secret = [seed; 32];
+        let mut order: Vec<&Vec<u8>> = txs.iter().collect();
+        if backwards {
+            order.reverse();
+        }
+        for tx in order {
+            pool.insert(tx, &state, 1, 10).unwrap();
+        }
+        let mut whole: Vec<Digest> = pool.entries().filter(|e| e.whole()).map(|e| e.txid).collect();
+        whole.sort_unstable();
+        assert_eq!((whole.len(), pool.held()), (18, 18 * size));
+        whole
+    };
+    assert_ne!(share(1, false), share(2, false));
+    assert_eq!(share(1, false), share(1, true));
+    // One too large for the older ones' room is not held, and lets
+    // none of them go for it; and a seed, with no room, holds none.
+    let large = spend_at(41, &[100, 101, 102], 100_000_000, 3_000_000, 100);
+    for position in 100..103 {
+        state.fund(position, 41, 100_000_000);
+    }
+    let mut pool = Mempool::with_policy(1 << 30, Policy::NONE.holding(0, 2 * size));
+    for tx in txs.iter().chain([&large]) {
         pool.insert(tx, &state, 1, 10).unwrap();
     }
-    assert_eq!((pool.whole(), pool.held()), (6, 6 * size));
-    // Two nodes hold different shares: each its own.
-    let share = |seed: u8| {
-        let mut pool = Mempool::with_policy(1 << 30, Policy::NONE.holding(0, 50, usize::MAX));
-        pool.secret = [seed; 32];
-        let ids: Vec<Digest> = txs.iter().map(|tx| pool.insert(tx, &state, 1, 10).unwrap()).collect();
-        ids.iter().map(|id| pool.entry(id).unwrap().whole()).collect::<Vec<_>>()
-    };
-    assert_ne!(share(1), share(2));
-    assert_eq!(share(1), share(1));
+    assert!(large.len() > 2 * size);
+    assert_eq!((pool.len(), pool.whole(), pool.held()), (41, 2, 2 * size));
+    let mut seed = Mempool::with_policy(1 << 30, Policy::NONE.holding(4 * size, 0));
+    for tx in &txs {
+        seed.insert(tx, &state, 1, 10).unwrap();
+    }
+    assert_eq!((seed.len(), seed.whole(), seed.older.len()), (40, 4, 0));
+}
+
+/// A pool knows of so many transactions and no more, whatever their
+/// bytes: with as many as it may know of it is full, and takes what
+/// pays more than its lowest and drops that, as a pool full by its
+/// bytes does. One that takes another's place is not one more.
+#[test]
+fn a_pool_knows_of_so_many_and_no_more() {
+    let mut state = Fake::default();
+    for tag in 1..=8 {
+        state.fund(u64::from(tag) - 1, tag, 10_000_000);
+    }
+    assert_eq!(Mempool::new(1 << 30).most(), DEFAULT_COUNT);
+    // Room for any number by their bytes; three, by their number; and
+    // nothing spared.
+    let mut pool = Mempool::with_policy(1 << 30, Policy { protect_bytes: 0, ..Policy::NONE }).knowing(3);
+    let a = pool.insert(&spend(1, 10_000_000, 1000), &state, 1, 0).unwrap();
+    let b = pool.insert(&spend(2, 10_000_000, 2000), &state, 1, 0).unwrap();
+    let c = pool.insert(&spend(3, 10_000_000, 3000), &state, 1, 0).unwrap();
+    assert_eq!((pool.len(), pool.admission_fee(0)), (3, 0));
+    // What pays less than the lowest is not worth dropping it for.
+    assert_eq!(pool.insert(&spend(4, 10_000_000, 500), &state, 1, 0), Err(Reject::Full));
+    // What takes the place of one of them is no more than there were.
+    let b2 = pool.insert(&spend(2, 10_000_000, 500_000), &state, 1, 0).unwrap();
+    assert!(!pool.contains(&b) && pool.contains(&b2) && pool.len() == 3 && pool.admission_fee(0) == 0);
+    // What pays more than the lowest takes its place, and the minimum
+    // is up past what that one paid.
+    let e = pool.insert(&spend(5, 10_000_000, 5000), &state, 1, 0).unwrap();
+    assert!(!pool.contains(&a) && pool.contains(&c) && pool.contains(&e) && pool.len() == 3);
+    assert!(pool.admission_fee(0) > 0);
+    assert!(matches!(pool.insert(&spend(6, 10_000_000, 1), &state, 1, 0), Err(Reject::FeeTooLow { .. })));
+    // And down again with time, and sooner for a pool that is not
+    // half full: of its number, as of its bytes.
+    let asked = pool.admission_fee(HALF_LIFE_SECS / 2);
+    pool.remove(&c);
+    pool.remove(&e);
+    assert!(pool.admission_fee(HALF_LIFE_SECS / 2) < asked);
+
+    // The oldest are spared, and no more of them than half of what
+    // the pool may know of, whatever their bytes.
+    let mut pool = Mempool::with_policy(1 << 30, Policy::NONE).knowing(4);
+    let ids: Vec<Digest> = (1..=4u32)
+        .map(|tag| pool.insert(&spend(tag, 10_000_000, 1000 * u64::from(tag)), &state, 1, 0).unwrap())
+        .collect();
+    let spared: Vec<bool> = ids.iter().map(|id| pool.is_protected(id)).collect();
+    assert_eq!(spared, [true, true, false, false]);
+    // (The third pays least of those not spared, and goes.)
+    let more = pool.insert(&spend(5, 10_000_000, 50_000), &state, 1, 0).unwrap();
+    assert!(pool.contains(&ids[0]) && pool.contains(&ids[1]) && !pool.contains(&ids[2]) && pool.contains(&more));
+    // A pool that may know of none takes none.
+    let mut none = Mempool::with_policy(1 << 30, Policy::NONE).knowing(0);
+    assert_eq!(none.insert(&spend(7, 10_000_000, 5000), &state, 1, 0), Err(Reject::Full));
 }
 
 /// Two unspent outputs with one commitment (one key hash, one amount)
@@ -586,7 +664,7 @@ fn name_operations_are_checked_claimed_and_selected() {
     let past = 10 + MAX_REVEAL + 1;
     assert_eq!(pool.insert(&reveal(1, salt, 50), &state, past, 0), Err(Reject::Name(NameReject::Expired(10))));
     let id = pool.insert(&reveal(1, salt, 50), &state, 20, 0).unwrap();
-    assert_eq!(pool.entry(&id).unwrap().claims, [Claim::Name(record.key()), Claim::Commit(50)]);
+    assert_eq!(pool.entry(&id).unwrap().claims[..], [Claim::Name(record.key()), Claim::Commit(50)]);
     // The name and the commit are that transaction's.
     assert_eq!(pool.insert(&reveal(2, salt, 50), &state, 20, 0), Err(Reject::NameConflict));
     // A block takes it once its commit has waited.
@@ -744,4 +822,34 @@ fn throughput() {
     let chosen = pool.select(&state, 2, 0, RESERVE_BYTES, |chosen| chosen.len() <= 10_878);
     println!("  a block's transactions chosen in {:.1?}: {} of {}", t.elapsed(), chosen.len(), pool.len());
     assert_eq!(chosen.len(), pool.len().min(10_878));
+}
+
+/// What the pool keeps of a transaction it does not hold whole: the
+/// record, and its part of the tables beside it, in bytes asked of the
+/// heap. As many transactions as fill the tables as full as the most a
+/// pool knows of does (a table of hashes is as full at 25,000 as at
+/// 200,000, eight times as many).
+#[test]
+#[ignore = "a count; run with --release --nocapture, and alone: it reads what the pool holds of the heap"]
+fn what_a_record_weighs() {
+    let n = 25_000u32;
+    let mut state = Fake::default();
+    for tag in 1..=n {
+        state.fund(u64::from(tag) - 1, tag, 100_000_000);
+    }
+    let txs: Vec<Vec<u8>> =
+        crate::parallel::par_map(n as usize, |i| spend(i as u32 + 1, 100_000_000, 1_000_001 + i as u64));
+    let before = crate::heap::held(crate::heap::Part::Pool);
+    let mut pool = Mempool::with_policy(1 << 30, Policy::NONE.holding(0, 0));
+    for tx in &txs {
+        pool.insert(tx, &state, 1, 10).unwrap();
+    }
+    let held = crate::heap::held(crate::heap::Part::Pool) - before;
+    assert_eq!((pool.len(), pool.whole()), (n as usize, 0));
+    println!(
+        "{n} records of {} bytes each as transactions: {held} bytes of heap, {} a record ({} the record itself)",
+        txs[0].len(),
+        held / n as usize,
+        std::mem::size_of::<Entry>()
+    );
 }
