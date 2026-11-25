@@ -9,6 +9,7 @@ pub use tabshared::*;
 
 pub mod chain;
 pub mod mempool;
+pub mod miner;
 pub mod net;
 pub mod proving;
 pub mod store;

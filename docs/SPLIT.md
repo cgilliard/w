@@ -793,7 +793,8 @@ program.
 `node/` has the store (`state`, `trie`, `outputs`, `names`, `window`,
 `blocks`, `commits`, `receive`), the chain (`apply`, `headers`,
 `leaves`, `receive`, `debug`), `proving`, the pool (`mempool`),
-`transport` and `net`: 240 tests optimised, 6 ignored.
+`transport`, `net` and `miner`: 246 tests optimised, 6 ignored (240
+run together before `miner` came, and its 6 since).
 
 - What `tabshared` has is in the node under the names it has there
   (`pub use tabshared::*` at the crate's root), so that a file of the
@@ -834,10 +835,21 @@ program.
 - Its comments point to `docs/WIRE.md` and `docs/THREADS.md`, which
   the reference has not got either.
 
+- `miner` is the reference's, whole, and still makes a block in one
+  call (`mine_with`): it takes its witness from `proving::witness_of`,
+  and two places are allowed as Clippy would not have them. Dividing
+  it at the two points of section 6 is next.
+- The three things section 6 left to confirm are confirmed, by
+  reading: a block's proof takes the items of the work it proves from
+  any `ItemSource`, and makes each from the seed text besides, so a
+  prover needs no table (`SeedText::at`); a nonce is 32 bytes that no
+  rule reads but to hash; and a header's time is set after its
+  block's proof is made, and is not under it.
+
 ### Left for the node
 
-- What of `miner`, `configuration`, `console` and `main` is the
-  node's.
+- Dividing `miner` (section 6), and what of `configuration`,
+  `console` and `main` is the node's.
 - Taking the wallet's key out of `net` (7.3).
 
 ### Still to decide
