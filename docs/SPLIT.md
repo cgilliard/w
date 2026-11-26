@@ -151,7 +151,9 @@ Two things to know about this:
 
 ### `tabminer`
 
-- `miner::solve` (the search for a nonce) and `miner::fill_table`
+- The loop over `job::solve` (the search for a nonce) and
+  `job::fill_table`, which are in `tabshared`: the node's tests and
+  its dev networks' tools look for nonces too
 - The table of the proof of work: making, keeping and growing it
   (`LazyDataset`, with `--pow-table` and `--prebuild-table`)
 - New: the job loop
@@ -304,14 +306,17 @@ startup, the proving setup, which takes time to make ready: so a
 prover stays connected and is not started for each job.
 
 A block's proof includes a proof of the work of the block before, so
-the prover also reads items of the proof of work. *To confirm: that it
-can make the few it reads from the seed text, as a node does when it
-checks a header (`pow::SeedText::at`), and so needs no table. The
-reference hands it the miner's table because it has one. The table is
-1 GB on mainnet and doubles yearly to 32 GB, so this decides how much
-memory a prover's machine wants.*
+the prover also reads items of the proof of work. It makes the few it
+reads from the seed text, as a node does when it checks a header
+(`pow::SeedText::at`), and needs no table: the proof makes each item
+from the text besides, whatever gave it the item. Measured on
+2026-11-25: one header's work checked takes some 14 µs with the table
+and some 7 ms from the text, and a block's proof 25 seconds either
+way. The reference hands the prover the miner's table because it has
+one.
 
-The witness has no encoding as bytes today. That is new code.
+The job's bytes are `tabshared::job::ProveJob`, and `docs/WORK.md` says
+them field by field.
 
 | Request | Does |
 |---|---|
@@ -331,17 +336,18 @@ of `NODE_ENHANCEMENTS.md`).
 | `POST /hash/found?job=` | A nonce and its mix. |
 
 - The nonce is 32 bytes, and the reference only counts in the first
-  eight. The node gives each miner its own prefix in the rest, so no
-  two search the same nonces. *To confirm: that nothing in the rules
-  reads the nonce's other bytes.*
+  eight. Nothing in the rules reads a nonce but to hash it, so the
+  other twenty-four are each miner's to set, at random: the node
+  hands out no ranges, and a pool deals its own out as it likes.
 - A miner needs the table of the proof of work, which it makes or
   reads from a file at startup, and grows when the chain's height asks
   for a larger one. The job carries the height for that reason.
 - The header's time is set when the job is made. In ten minutes it
   goes stale, so the node gives out the job again with the time
-  renewed. *To confirm: that the time is not under the block's proof,
-  so that this takes no new proof. `mine_with` sets it after proving,
-  which suggests so.*
+  renewed. The time is not under the block's proof (the proof is made
+  before there is a header), so this takes no new proof.
+- The job is JSON (`tabshared::job::HashJob`), and its hash names it:
+  `docs/WORK.md`.
 - The node checks what a miner sends, as it checks any block. There
   are no shares, no accounts and no payouts: this serves one person's
   machines, not a pool. A hash rate is what a miner says of itself.
@@ -835,10 +841,15 @@ run together before `miner` came, and its 6 since).
 - Its comments point to `docs/WIRE.md` and `docs/THREADS.md`, which
   the reference has not got either.
 
-- `miner` is the reference's, whole, and still makes a block in one
-  call (`mine_with`): it takes its witness from `proving::witness_of`,
-  and two places are allowed as Clippy would not have them. Dividing
-  it at the two points of section 6 is next.
+- `miner` is the reference's, divided at the two points of section 6:
+  `draft` begins a block and gives the job of proving it,
+  `Draft::proven` takes a proof, checks it and gives the job of
+  finding the nonce, and `Proven::block` takes a nonce. `mine_with` is
+  the three joined, for the tests and the dev networks' tools, and
+  proves its job from the job's bytes. The jobs, `solve` and
+  `fill_table` are `tabshared::job`. `choose` takes a proof's level
+  (`Level::fits`) and not a setup, of which a node that proves nothing
+  has none.
 - The three things section 6 left to confirm are confirmed, by
   reading: a block's proof takes the items of the work it proves from
   any `ItemSource`, and makes each from the seed text besides, so a
@@ -848,8 +859,8 @@ run together before `miner` came, and its 6 since).
 
 ### Left for the node
 
-- Dividing `miner` (section 6), and what of `configuration`,
-  `console` and `main` is the node's.
+- What of `configuration`, `console` and `main` is the node's, and
+  the work port that serves the jobs.
 - Taking the wallet's key out of `net` (7.3).
 
 ### Still to decide

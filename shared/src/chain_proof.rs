@@ -83,6 +83,8 @@ pub struct Statement {
 
 /// Elements of a [`Statement`].
 pub const STATEMENT: usize = 22;
+/// Serialized size of a [`Statement`] ([`Statement::to_bytes`]).
+pub const STATEMENT_BYTES: usize = 7 * 32 + 5 * 4 + 8 + 2 * 16;
 
 /// What counts blocks down: a block fewer is this many times less.
 const COUNT: F = F(2);
@@ -246,6 +248,53 @@ impl Statement {
     /// a block's header names ([`crate::block::Header`]).
     pub fn digest(&self) -> Digest {
         crate::alg::statement(&self.elements())
+    }
+
+    /// The statement as bytes: its fields in the order they are
+    /// declared, numbers little-endian.
+    pub fn to_bytes(&self) -> [u8; STATEMENT_BYTES] {
+        let mut w = crate::codec::Writer::with_capacity(STATEMENT_BYTES);
+        w.digest(&self.program);
+        w.u32(self.height);
+        w.digest(&self.root);
+        w.u64(self.next);
+        w.digest(&self.inputs);
+        w.digest(&self.outputs);
+        w.bytes(&self.sum_in.to_le_bytes());
+        w.bytes(&self.sum_out.to_le_bytes());
+        w.u32(self.era);
+        w.u32(self.left);
+        w.digest(&self.names);
+        w.digest(&self.tip);
+        w.digest(&self.ops);
+        w.u32(self.table);
+        w.u32(self.grows);
+        w.finish().try_into().expect("a statement's size")
+    }
+
+    /// The statement [`STATEMENT_BYTES`] bytes are: none of any other
+    /// length.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Statement> {
+        let mut r = crate::codec::Reader(bytes);
+        let wide = |r: &mut crate::codec::Reader| Some(u128::from_le_bytes(r.take(16)?.try_into().ok()?));
+        let statement = Statement {
+            program: r.digest()?,
+            height: r.u32()?,
+            root: r.digest()?,
+            next: r.u64()?,
+            inputs: r.digest()?,
+            outputs: r.digest()?,
+            sum_in: wide(&mut r)?,
+            sum_out: wide(&mut r)?,
+            era: r.u32()?,
+            left: r.u32()?,
+            names: r.digest()?,
+            tip: r.digest()?,
+            ops: r.digest()?,
+            table: r.u32()?,
+            grows: r.u32()?,
+        };
+        r.end().then_some(statement)
     }
 
     /// The era of the emission a block at `height` is in (one past the

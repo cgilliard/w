@@ -18,26 +18,37 @@
 //! last block, or the node is stopping):
 //!
 //! 1. The reward's output, and the witnesses of it and of the
-//!    transactions chosen, against the state as it is.
-//! 2. The block's proof: what takes the time.
-//! 3. The header, and a nonce whose hash meets the target: on every
-//!    thread there is, each trying its own nonces.
+//!    transactions chosen, against the state as it is ([`draft`]).
+//! 2. The block's proof: what takes the time
+//!    ([`crate::job::ProveJob::prove`]).
+//! 3. The proof checked, and the header ([`Draft::proven`]).
+//! 4. A nonce whose hash meets the target: on every thread there is,
+//!    each trying its own nonces ([`crate::job::HashJob::solve`]).
+//! 5. The block, whole ([`Proven::block`]).
+//!
+//! The first, third and fifth are the node's. The second and fourth are
+//! work it gives out, as jobs ([`crate::job`]), to whoever proves and
+//! whoever hashes for it: each job says all that doing it takes, and
+//! what comes back is checked here as anything from outside is.
+//! [`mine_with`] is the five together in one place, for the tests and
+//! for the dev networks' tools: its job goes through its bytes, as one
+//! sent does.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::block::{Block, Body, BodyRef, HEADER_SIZE, Header};
 use crate::chain::Chain;
 use crate::chain::verify::{BlockStatement, ProofVerifier};
+use crate::chain_proof::Statement;
 use crate::difficulty::Target;
 use crate::error::Error;
-use crate::hash::{Digest, EMPTY};
-use crate::ledger::Record;
+use crate::hash::Digest;
+use crate::job::{Found, HashJob, Proof, ProveJob};
+pub use crate::job::{fill_table, solve};
 use crate::mempool::{Mempool, PROOF_BYTES};
 use crate::output::Output;
-use crate::pow::{ItemSource, LazyDataset, Nonce, hashimoto, nonce_from_u64};
-use crate::prover::{ChainVerifier, Contents, Setup, Signing};
+use crate::pow::ItemSource;
+use crate::prover::{ChainVerifier, Level, Setup};
 use crate::proving::witness_of;
 use crate::store::backend::Backend;
 use crate::transaction::Transaction;
@@ -123,31 +134,6 @@ impl HoldOff {
     }
 }
 
-/// Fills what is missing of `table`, on every thread there is, and says
-/// how far it has got: `progress` is called with each twentieth of the
-/// table that has come to be there (5, 10, ... 95 in a hundred), as
-/// that is seen, the table being looked at every `look`. A table
-/// filled faster than it is looked at passes some of them by.
-pub fn fill_table(table: &LazyDataset<'_>, look: Duration, progress: &(dyn Fn(u32) + Sync)) {
-    let twentieths = || (table.filled() * 20 / table.pairs()) as u32;
-    let done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            table.fill();
-            done.store(true, Ordering::Release);
-        });
-        let mut said = twentieths();
-        while !done.load(Ordering::Acquire) {
-            std::thread::sleep(look);
-            let now = twentieths();
-            if now > said && now < 20 {
-                said = now;
-                progress(5 * now);
-            }
-        }
-    });
-}
-
 /// What came of trying to make a block.
 ///
 /// (A block made carries its header, and so is some 300 bytes where
@@ -178,11 +164,12 @@ pub enum Mined {
 /// proofs of one block hold), its transactions are one run's, and it is
 /// no larger than a block may be. `with_pool` gives the pool, held
 /// while they are chosen: the state is taken first, as by everyone
-/// that takes both.
+/// that takes both. `level` is the level of the network's proofs:
+/// whoever chooses needs no more of a setup.
 #[allow(clippy::type_complexity)]
-pub fn choose<B: Backend + 'static>(
-    chain: &Chain<B, ChainVerifier>,
-    setup: &Setup,
+pub fn choose<B: Backend + 'static, V>(
+    chain: &Chain<B, V>,
+    level: &Level,
     with_pool: &dyn Fn(&mut dyn FnMut(&Mempool)),
     max_signatures: usize,
 ) -> Result<(Vec<Transaction>, Vec<u64>), Error> {
@@ -192,7 +179,7 @@ pub fn choose<B: Backend + 'static>(
     let height = snap.tip().0 + 1;
     let sweeps = Mempool::sweeps(&snap, height);
     let mut chosen: Vec<Transaction> = Vec::new();
-    let most = max_signatures.min(setup.level.signatures());
+    let most = max_signatures.min(level.signatures());
     if most == 0 {
         return Ok((chosen, sweeps));
     }
@@ -215,7 +202,7 @@ pub fn choose<B: Backend + 'static>(
             if HEADER_SIZE + Body::size_of(spends, makes, names, PROOF_BYTES) > params.max_block_size {
                 return false;
             }
-            setup.fits(snap.outputs().next, &so_far, sweeps.len())
+            level.fits(snap.outputs().next, &so_far, sweeps.len())
         });
         chosen = taken.iter().map(|tx| tx.to_transaction()).collect();
     });
@@ -252,27 +239,25 @@ pub fn mine<B: Backend + 'static, S: ItemSource + Sync>(
     mine_with(chain, setup, dataset, &Output::to_key_hash(reward, due), unix, start, &[], &[], proved, cancel)
 }
 
-/// The chain's proof the block of `tip` carried, as the proof before
-/// the next block's: where a chain begins, before the first.
-fn before<B: Backend + 'static>(
-    chain: &Chain<B, ChainVerifier>,
-    setup: &Setup,
+/// What the chain's proof stated with the block of `tip` in, and the
+/// proof that block carried: what the next block's proof builds on.
+/// None where a chain begins, before the first.
+fn before<B: Backend + 'static, V: ProofVerifier + Sync>(
+    chain: &Chain<B, V>,
     tip: &Header,
     roots: &(Digest, Digest),
     next: u64,
-) -> Result<crate::prover::Before, Error> {
+) -> Result<Option<(Statement, Vec<u8>)>, Error> {
     if tip.height == 0 {
-        return Ok(setup.beginning());
+        return Ok(None);
     }
     let bytes = chain.body(&tip.hash())?.ok_or(Error::BadProof)?;
     let body = BodyRef::from_bytes(&bytes)?;
     let stated = chain.statement(tip.height, &tip.prev_hash, &body, roots, next);
-    // (A proof before that this build does not take is not built on:
-    // the block's own could not be made, and is not tried.)
     if stated.digest() != tip.statement {
         return Err(Error::BadProof);
     }
-    setup.carried(body.proof(), &stated).ok_or(Error::BadProof)
+    Ok(Some((stated, body.proof().to_vec())))
 }
 
 /// Whether the proof of `chain`'s last block is one this build takes:
@@ -300,86 +285,88 @@ pub fn last_proof_holds<B: Backend + 'static>(chain: &Chain<B, ChainVerifier>) -
     Ok(stated.digest() == tip.statement && chain.verifier().verify(&statement, body.proof()))
 }
 
-/// Makes the block after `chain`'s last, of the transactions `pooled`
+/// A block begun: what the node keeps of it while its proof is made.
+pub struct Draft {
+    /// The header it builds on.
+    tip: Header,
+    /// Its body, without its proof.
+    body: Body,
+    /// What its header is to say of the state after it, and what the
+    /// chain's proof is to state with it in.
+    state_root: Digest,
+    stated: Statement,
+}
+
+/// What came of beginning a block ([`draft`]).
+///
+/// (A block begun is some 700 bytes where the others are none: one is
+/// made for a block and let go with it, so it is left as it is.)
+#[allow(clippy::large_enum_variant)]
+pub enum Drafted {
+    /// The job of proving it, and what is kept meanwhile.
+    Begun(Box<ProveJob>, Draft),
+    /// The chain has another last block than the state is of.
+    Cancelled,
+    /// As [`Mined::Stale`].
+    Stale,
+    /// As [`Mined::Finished`].
+    Finished,
+}
+
+/// Begins the block after `chain`'s last, of the transactions `pooled`
 /// and sweeping the commits at `sweeps` ([`choose`]), paying its reward
 /// and their fees ([`reward_due`]) by the output `paid`, which is the
-/// maker's own. `unix` is the time by the calendar, in seconds,
-/// and `start` where the nonces tried begin (any number: so that two
-/// miners do not try the same). `proved` is called when the block's
-/// proof is made, with how long that took: from then the nonce is
-/// looked for. `cancel` is asked now and then whether to give up.
+/// maker's own: the job of proving it, which says all that takes, and
+/// what the node keeps until the proof comes ([`Draft::proven`]).
 ///
-/// `dataset` is the table of the proof of work for that block's
-/// height, which is the table of the header before's wherever the two
-/// are of one epoch: whole, or one that fills as it is read
-/// ([`crate::pow::LazyDataset`]).
-#[allow(clippy::too_many_arguments)]
-pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
-    chain: &Chain<B, ChainVerifier>,
-    setup: &Setup,
-    dataset: &S,
+/// Nothing is proven here, and nothing of a setup is needed: a chain
+/// whose proofs go unchecked begins a block as any does.
+pub fn draft<B: Backend + 'static, V: ProofVerifier + Sync>(
+    chain: &Chain<B, V>,
     paid: &Output,
-    unix: u64,
-    start: u64,
     pooled: &[Transaction],
     sweeps: &[u64],
-    proved: &dyn Fn(Duration),
-    cancel: &(dyn Fn() -> bool + Sync),
-) -> Result<Mined, Error> {
+) -> Result<Drafted, Error> {
     let params = *chain.params();
     let tip = chain.tip()?;
     let height = tip.height + 1;
     let subsidy = params.subsidy(height);
     if subsidy == 0 {
-        return Ok(Mined::Finished);
+        return Ok(Drafted::Finished);
     }
     // The reward pays what the block may make and what its
     // transactions leave: an output made for another block's is not
     // this block's.
     let fees: u64 = pooled.iter().map(|tx| tx.balance().clamp(0, u64::MAX as i128) as u64).sum();
     if paid.amount != subsidy.saturating_add(fees) {
-        return Ok(Mined::Stale);
+        return Ok(Drafted::Stale);
     }
-    let began = Instant::now();
     let state = chain.whole()?;
-    let (witness, start_at, roots, next) = {
+    let (witness, roots, next) = {
         let snap = state.snapshot()?;
         // (The state of the block being built on, or it has moved on.)
         // (The state before the first block is of no block.)
         let (at, id) = snap.tip();
         if at != tip.height || (at > 0 && id != tip.hash()) {
-            return Ok(Mined::Cancelled);
+            return Ok(Drafted::Cancelled);
         }
         let witness = match witness_of(&snap, pooled, sweeps) {
             Ok(witness) => witness,
             // What a transaction of the pool spends is not there.
-            Err(Error::NoSuchOutput(_)) if !pooled.is_empty() || !sweeps.is_empty() => return Ok(Mined::Stale),
+            Err(Error::NoSuchOutput(_)) if !pooled.is_empty() || !sweeps.is_empty() => return Ok(Drafted::Stale),
             Err(e) => return Err(e),
         };
-        let (roots, next) = ((snap.outputs().hash(), snap.names().hash()), snap.outputs().next);
-        let record = Record {
-            root: [roots.0; 2],
-            inputs: [EMPTY; 2],
-            outputs: [EMPTY; 2],
-            next: [next; 2],
-            sum_in: subsidy as u128,
-            sum_out: 0,
-            height,
-            names: [roots.1; 2],
-            ops: [EMPTY; 2],
-            done: [EMPTY; 2],
-        };
-        (witness, record, roots, next)
+        (witness, (snap.outputs().hash(), snap.names().hash()), snap.outputs().next)
     };
     drop(state);
     // (Asked of the chain once its state is let go of: to ask the
     // chain while holding its state is to take what keeps it twice,
     // which waits for ever on anyone waiting to write between the
     // two.)
-    let chained = before(chain, setup, &tip, &roots, next)?;
+    let before = before(chain, &tip, &roots, next)?;
     // The body, without its proof: what the header is of, and what the
     // proof is to state.
-    let mut body = Body {
+    let body = Body {
         inputs: pooled.iter().flat_map(|tx| tx.spent_positions()).collect(),
         outputs: [paid].into_iter().chain(pooled.iter().flat_map(|tx| &tx.outputs)).map(Output::block_output).collect(),
         ops: pooled.iter().flat_map(|tx| &tx.ops).map(|op| op.block_op()).collect(),
@@ -394,58 +381,163 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
         // is a name taken, or a commit out of its window: the pool has
         // not yet been looked over.
         Err(Error::Io(kind)) => return Err(Error::Io(kind)),
-        Err(_) => return Ok(Mined::Stale),
+        Err(_) => return Ok(Drafted::Stale),
     };
-    // The signatures, proven; and the block's proof on the proof before.
-    let signings: Vec<Signing> = pooled.iter().flat_map(Transaction::signings).collect();
-    let signed = match signings.is_empty() {
-        true => None,
-        false => match setup.sign(&signings) {
-            Some(signed) => Some(signed),
-            None => return Ok(Mined::Stale),
-        },
+    let job = ProveJob {
+        program: params.program,
+        parent: tip,
+        before,
+        roots,
+        next,
+        subsidy,
+        witness,
+        txs: pooled.to_vec(),
+        sweeps: sweeps.to_vec(),
+        reward: *paid,
     };
-    if cancel() {
-        return Ok(Mined::Cancelled);
+    Ok(Drafted::Begun(Box::new(job), Draft { tip, body, state_root, stated }))
+}
+
+impl Draft {
+    /// The height of the block begun, and the header it builds on.
+    pub fn on(&self) -> &Header {
+        &self.tip
     }
-    let contents = Contents { txs: pooled, sweeps, reward: paid };
-    let Some(proof) = setup.block(dataset, &tip, &chained, &start_at, witness, &contents, signed.as_ref()) else {
-        return Ok(Mined::Stale);
+
+    /// The block with `proof` for its proof, which came of the job: its
+    /// header, for its nonce to be found. `unix` is the time by the
+    /// calendar, in seconds.
+    ///
+    /// The proof is whatever was handed over, and is checked as the
+    /// chain will check the block's: one that is no proof of this block
+    /// is refused here ([`Error::BadProof`]), as is one that makes the
+    /// block larger than a block may be.
+    pub fn proven<B: Backend + 'static, V: ProofVerifier + Sync>(
+        self,
+        chain: &Chain<B, V>,
+        proof: Vec<u8>,
+        unix: u64,
+    ) -> Result<Proven, Error> {
+        let Draft { tip, mut body, state_root, stated } = self;
+        body.proof = proof;
+        let size = HEADER_SIZE + body.size();
+        if size > chain.params().max_block_size {
+            return Err(Error::TooLarge(size));
+        }
+        // (What was proven is what the chain will ask of the block.)
+        let whole = body.to_bytes();
+        let statement = BlockStatement { chain: stated, digest: stated.digest(), body: BodyRef::from_bytes(&whole)? };
+        if !chain.verifier().verify(&statement, &body.proof) {
+            return Err(Error::BadProof);
+        }
+        let header = Header {
+            prev_hash: tip.hash(),
+            height: tip.height + 1,
+            timestamp: unix.max(chain.earliest_timestamp(&tip)?),
+            body_commitment: body.commitment(),
+            state_root,
+            statement: stated.digest(),
+            aux: chain.aux_root()?,
+            mix: tip.mix,
+            nonce: [0; 32],
+        };
+        let target = chain.expected_target(&tip)?;
+        Ok(Proven { header, body, target })
+    }
+}
+
+/// A block proven: all of it but its nonce.
+pub struct Proven {
+    /// Its header, with no nonce yet.
+    header: Header,
+    body: Body,
+    target: Target,
+}
+
+impl Proven {
+    /// The job of finding its nonce.
+    pub fn job(&self) -> HashJob {
+        HashJob { height: self.header.height, hash: self.header.pow_hash(), target: self.target }
+    }
+
+    /// The block with the nonce `found`, whole, and its header. None if
+    /// what was found is not this header's, or does not claim work that
+    /// meets its target: whether the work is as claimed is for the chain
+    /// to say when it takes the block, as of any block.
+    pub fn block(&self, found: &Found) -> Option<(Vec<u8>, Header)> {
+        if !found.claims(&self.job()) {
+            return None;
+        }
+        let header = Header { nonce: found.nonce, mix: found.mix, ..self.header };
+        Some((Block { header, body: self.body.clone() }.to_bytes(), header))
+    }
+}
+
+/// Makes the block after `chain`'s last, of the transactions `pooled`
+/// and sweeping the commits at `sweeps` ([`choose`]), paying its reward
+/// and their fees ([`reward_due`]) by the output `paid`, which is the
+/// maker's own. `unix` is the time by the calendar, in seconds,
+/// and `start` where the nonces tried begin (any number: so that two
+/// miners do not try the same). `proved` is called when the block's
+/// proof is made, with how long that took: from then the nonce is
+/// looked for. `cancel` is asked now and then whether to give up.
+///
+/// `dataset` is the table of the proof of work for that block's
+/// height, which is the table of the header before's wherever the two
+/// are of one epoch: whole, or one that fills as it is read
+/// ([`crate::pow::LazyDataset`]).
+///
+/// All of a block's steps, in one place: the block is begun
+/// ([`draft`]), its job proven as whoever is sent one proves it, from
+/// its bytes, and its nonce found as whoever is sent that job finds it.
+#[allow(clippy::too_many_arguments)]
+pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
+    chain: &Chain<B, ChainVerifier>,
+    setup: &Setup,
+    dataset: &S,
+    paid: &Output,
+    unix: u64,
+    start: u64,
+    pooled: &[Transaction],
+    sweeps: &[u64],
+    proved: &dyn Fn(Duration),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Mined, Error> {
+    let began = Instant::now();
+    let (job, draft) = match draft(chain, paid, pooled, sweeps)? {
+        Drafted::Begun(job, draft) => (job, draft),
+        Drafted::Cancelled => return Ok(Mined::Cancelled),
+        Drafted::Stale => return Ok(Mined::Stale),
+        Drafted::Finished => return Ok(Mined::Finished),
+    };
+    // (A proof before that this build does not take is not built on:
+    // the block's own could not be made, and is not tried.)
+    if let Some((stated, proof)) = &job.before {
+        setup.carried(proof, stated).ok_or(Error::BadProof)?;
+    }
+    // The signatures, proven; and the block's proof on the proof before.
+    let job = ProveJob::from_bytes(&job.to_bytes())?;
+    let proof = match job.prove(setup, dataset, &|| cancel()) {
+        Proof::Made(proof) => proof,
+        Proof::Refused => return Ok(Mined::Stale),
+        Proof::GivenUp => return Ok(Mined::Cancelled),
     };
     // The chain may have another last block by now, heard of while the
     // proof was made: then this block is for nothing.
     if cancel() {
         return Ok(Mined::Cancelled);
     }
-    body.proof = proof;
-    // (What was proven is what the chain will ask of the block.)
-    let whole = body.to_bytes();
-    let statement = BlockStatement { chain: stated, digest: stated.digest(), body: BodyRef::from_bytes(&whole)? };
-    if !chain.verifier().verify(&statement, &body.proof) {
-        return Err(Error::BadProof);
-    }
+    let proven = draft.proven(chain, proof, unix)?;
     let took = began.elapsed();
     // The proof is made: what is left is to find the nonce.
     proved(took);
-    let header = Header {
-        prev_hash: tip.hash(),
-        height,
-        timestamp: unix.max(chain.earliest_timestamp(&tip)?),
-        body_commitment: body.commitment(),
-        state_root,
-        statement: stated.digest(),
-        aux: chain.aux_root()?,
-        mix: tip.mix,
-        nonce: [0; 32],
-    };
-    let target = chain.expected_target(&tip)?;
     let began = Instant::now();
-    let Some((nonce, mix, hashes)) = solve(dataset, &header.pow_hash(), &target, start, cancel) else {
+    let Some((found, hashes)) = proven.job().solve(dataset, start, cancel) else {
         return Ok(Mined::Cancelled);
     };
-    let header = Header { nonce, mix, ..header };
+    let (block, header) = proven.block(&found).ok_or(Error::BadProofOfWork)?;
     let solved = began.elapsed();
-    Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
+    Ok(Mined::Block { block, header, proved: took, hashes, solved })
 }
 
 /// Debugging only: how many outputs and spends of those asked for a
@@ -608,7 +700,9 @@ pub fn extend_empty<B: Backend + 'static>(
     unix: u64,
     progress: &dyn Fn(u32),
 ) -> Result<(), Error> {
+    use crate::hash::EMPTY;
     use crate::output::BlockOutput;
+    use crate::pow::nonce_from_u64;
     let params = *chain.params();
     loop {
         let tip = chain.tip()?;
@@ -672,69 +766,9 @@ pub fn extend_empty<B: Backend + 'static>(
     }
 }
 
-/// A nonce whose hash with `header_hash` meets `target`, with the mix
-/// that goes in the header beside it, and how many were tried: on
-/// every thread there is, the nonces from `start` dealt out among
-/// them. None if `cancel` said to give up first.
-pub fn solve<S: ItemSource + Sync>(
-    dataset: &S,
-    header_hash: &Digest,
-    target: &Target,
-    start: u64,
-    cancel: &(dyn Fn() -> bool + Sync),
-) -> Option<(Nonce, Digest, u64)> {
-    let threads = crate::parallel::threads() as u64;
-    let (done, tried) = (AtomicBool::new(false), AtomicU64::new(0));
-    let found = Mutex::new(None);
-    std::thread::scope(|scope| {
-        for t in 0..threads {
-            let (done, tried, found) = (&done, &tried, &found);
-            scope.spawn(move || {
-                let (mut n, mut mine) = (start.wrapping_add(t), 0u64);
-                while !done.load(Ordering::Relaxed) {
-                    let nonce = nonce_from_u64(n);
-                    let out = hashimoto(dataset, header_hash, &nonce);
-                    mine += 1;
-                    if target.is_met_by(&out.result) && !done.swap(true, Ordering::Relaxed) {
-                        *found.lock().unwrap_or_else(|e| e.into_inner()) = Some((nonce, out.mix));
-                    }
-                    // (One of them asks, and not at every hash.)
-                    if t == 0 && mine.is_multiple_of(64) && cancel() {
-                        done.store(true, Ordering::Relaxed);
-                    }
-                    n = n.wrapping_add(threads);
-                }
-                tried.fetch_add(mine, Ordering::Relaxed);
-            });
-        }
-    });
-    let (nonce, mix) = found.into_inner().unwrap_or_else(|e| e.into_inner())?;
-    Some((nonce, mix, tried.into_inner()))
-}
-
 #[cfg(test)]
 mod hold_off {
     use super::*;
-
-    /// A table is filled whole, and how far it has got is said in
-    /// twentieths, each once and in order, none of them the last.
-    #[test]
-    fn a_table_is_filled_and_says_how_far_it_has_got() {
-        let seed = crate::pow::SeedText::new(crate::pow::PowParams {
-            log_dataset_items: 12,
-            max_log_dataset_items: 12,
-            ..crate::pow::PowParams::MAINNET
-        });
-        let table = LazyDataset::new(&seed, 12).unwrap();
-        let said = Mutex::new(Vec::new());
-        fill_table(&table, Duration::from_micros(200), &|percent| said.lock().unwrap().push(percent));
-        assert!(table.is_complete());
-        let said = said.into_inner().unwrap();
-        assert!(said.windows(2).all(|w| w[0] < w[1]), "{said:?}");
-        assert!(said.iter().all(|p| p % 5 == 0 && (5..=95).contains(p)), "{said:?}");
-        // Whole already: nothing to fill, nothing to say.
-        fill_table(&table, Duration::from_micros(200), &|_| panic!("nothing was to be said"));
-    }
 
     /// A chain ahead is waited for so long, and no longer; another
     /// chain ahead is waited for afresh; and with none ahead, blocks
@@ -773,6 +807,8 @@ mod hold_off {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::block::BlockRef;
     use crate::chain::apply::Applied;
@@ -822,8 +858,8 @@ mod tests {
             pool.insert(&tx.to_bytes(), &snap, 2, NOW).unwrap();
         }
         // Nothing is chosen for a miner that is to prove no signatures.
-        assert!(choose(&chain, setup, &|f| f(&pool), 0).unwrap().0.is_empty());
-        let (pooled, sweeps) = choose(&chain, setup, &|f| f(&pool), MAX_SIGNATURES).unwrap();
+        assert!(choose(&chain, &setup.level, &|f| f(&pool), 0).unwrap().0.is_empty());
+        let (pooled, sweeps) = choose(&chain, &setup.level, &|f| f(&pool), MAX_SIGNATURES).unwrap();
         assert_eq!((pooled.len(), sweeps.len()), (1, 0));
         let due = reward_due(&chain, &pooled).unwrap().unwrap();
         assert_eq!(due, (2, params.subsidy(2) + fee));
@@ -875,7 +911,7 @@ mod tests {
                     pool.insert(tx, &snap, height, NOW).unwrap();
                 }
             }
-            let (pooled, sweeps) = choose(&chain, setup, &|f| f(pool), MAX_SIGNATURES).unwrap();
+            let (pooled, sweeps) = choose(&chain, &setup.level, &|f| f(pool), MAX_SIGNATURES).unwrap();
             assert_eq!(pooled.len(), txs.len());
             let pay = Output::to_key_hash(&[0xEE; 32], reward_due(&chain, &pooled).unwrap().unwrap().1);
             let made = mine_with(&chain, setup, dataset, &pay, NOW, 1, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
@@ -986,7 +1022,7 @@ mod tests {
                 pool.insert(&tx.to_bytes(), &snap, 3, NOW).unwrap();
             }
         }
-        let (pooled, sweeps) = choose(&chain, setup, &|f| f(&pool), MAX_SIGNATURES).unwrap();
+        let (pooled, sweeps) = choose(&chain, &setup.level, &|f| f(&pool), MAX_SIGNATURES).unwrap();
         assert_eq!((pooled.len(), sweeps.len()), (2, 0));
         let pay = Output::to_key_hash(&mine_to, reward_due(&chain, &pooled).unwrap().unwrap().1);
         let made = mine_with(&chain, setup, dataset, &pay, NOW, 1, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
@@ -1009,7 +1045,9 @@ mod tests {
     fn blocks_are_filled_and_a_chain_is_made_beforehand() {
         use crate::chain::headers::tests::easy;
         use crate::chain::params::ChainParams;
-        use crate::prover::{Level, Parts};
+        use crate::hash::EMPTY;
+        use crate::prover::Parts;
+        use std::sync::Mutex;
         let open = |params: ChainParams| {
             let verifier = ChainVerifier::of(&Level::SMALL, &Parts::dev()).unchecked();
             let chain = Chain::open(MemBackend::new(), 8, params, seed(), verifier).unwrap();
@@ -1074,5 +1112,224 @@ mod tests {
         assert_eq!(claimed.mix, EMPTY);
         assert_ne!(chain.header_at(WORKED).unwrap().unwrap().mix, EMPTY);
         assert_ne!(chain.header_at(blocks).unwrap().unwrap().mix, EMPTY);
+    }
+
+    /// What each output of [`funded`] holds, and what a payment leaves
+    /// for whoever makes its block, for each output it spends.
+    const HELD: u64 = 100_000_000;
+    const FEE: u64 = 1_000_000;
+
+    type Unchecked = Chain<MemBackend, crate::chain::verify::AcceptAllProofs>;
+
+    fn key(tag: u32) -> crate::xmss::SecretKey {
+        let mut seed = [0u8; 32];
+        seed[..4].copy_from_slice(&tag.to_le_bytes());
+        crate::xmss::SecretKey::generate(&seed)
+    }
+
+    /// A chain whose proofs go unchecked, in which each of `keys` keys
+    /// (those of the tags from 1) has two outputs of [`HELD`]: the key
+    /// of tag `t` the one `2 * (t - 1)` on from the position returned,
+    /// and the one after it.
+    fn funded(keys: u32) -> (Unchecked, u64) {
+        use crate::chain::apply::tests::extend_with;
+        use crate::chain::headers::tests::easy;
+        let chain = Chain::open(MemBackend::new(), 8, easy(), seed(), crate::chain::verify::AcceptAllProofs).unwrap();
+        chain.set_dataset(table());
+        let first = chain.state().snapshot().unwrap().outputs().next;
+        let outputs: Vec<crate::output::BlockOutput> = crate::parallel::par_map(keys as usize, |i| {
+            Output::new(&key(i as u32 + 1).public_key(), HELD).block_output()
+        });
+        // (In one block, which makes what a block may and no more: the
+        // rest of it is nobody's, and is the block's last output.)
+        let mut made: Vec<crate::output::BlockOutput> = outputs.iter().flat_map(|o| [*o, *o]).collect();
+        let rest = chain.params().subsidy(1) - HELD * made.len() as u64;
+        made.push(Output::to_key_hash(&[0xee; 32], rest).block_output());
+        extend_with(&chain, &made);
+        (chain, first)
+    }
+
+    /// A payment by the key of tag `tag` on the chain of [`funded`],
+    /// whose outputs begin at `first`: of one of its outputs or of both,
+    /// half to the next key and the rest, less [`FEE`] for each, back to
+    /// itself.
+    fn payment(tag: u32, first: u64, both: bool) -> Transaction {
+        let mut key = key(tag);
+        let (own, at) = (key.public_key(), first + 2 * (tag as u64 - 1));
+        let positions: Vec<u64> = (at..at + 1 + both as u64).collect();
+        let held = HELD * positions.len() as u64;
+        let fee = FEE * positions.len() as u64;
+        let to = crate::output::pubkey_hash(&own).map(|b| b ^ 0x5a);
+        UnsignedTransaction::new(
+            positions.iter().map(|_| (own, HELD)).collect(),
+            vec![Output::to_key_hash(&to, held / 2), Output::new(&own, held - held / 2 - fee)],
+        )
+        .at(&positions)
+        .sign(|_, _, m| key.sign(m))
+        .unwrap()
+    }
+
+    /// A block is made in steps, and whoever does one needs only what
+    /// it is handed: the node begins the block and gives out the job of
+    /// proving it, which is read back whole from its bytes; with a
+    /// proof it gives out the job of finding the nonce; and with the
+    /// nonce it has the block, which the chain takes. Nothing is proven
+    /// here: the chain's proofs go unchecked.
+    #[test]
+    fn a_block_is_made_in_steps() {
+        let (chain, first) = funded(3);
+        let level = &Level::MAINNET;
+        let mut pool = Mempool::with_policy(1 << 20, crate::mempool::Policy::MAINNET.holding_all());
+        let txs = [payment(1, first, false), payment(2, first, true)];
+        {
+            let state = chain.state();
+            let snap = state.snapshot().unwrap();
+            txs.iter().for_each(|tx| _ = pool.insert(&tx.to_bytes(), &snap, snap.tip().0 + 1, NOW).unwrap());
+        }
+        let tip = chain.tip().unwrap();
+        let (pooled, sweeps) = choose(&chain, level, &|f| f(&pool), MAX_SIGNATURES).unwrap();
+        assert_eq!((pooled.len(), sweeps.len()), (2, 0));
+        let (height, due) = reward_due(&chain, &pooled).unwrap().unwrap();
+        assert_eq!((height, due), (tip.height + 1, chain.params().subsidy(height) + 3 * FEE));
+        let paid = Output::to_key_hash(&[9; 32], due);
+        // A reward that is not what this block pays: none is begun.
+        let other = Output::to_key_hash(&[9; 32], due + 1);
+        assert!(matches!(draft(&chain, &other, &pooled, &sweeps).unwrap(), Drafted::Stale));
+
+        // The job says the block, and what is before it.
+        let begin = || match draft(&chain, &paid, &pooled, &sweeps).unwrap() {
+            Drafted::Begun(job, draft) => (job, draft),
+            _ => panic!("no block begun"),
+        };
+        let (job, begun) = begin();
+        assert_eq!((job.height(), job.parent, begun.on()), (height, tip, &tip));
+        assert_eq!((job.program, job.subsidy), (chain.params().program, chain.params().subsidy(height)));
+        assert_eq!((job.txs.len(), job.reward, job.next), (2, paid, first + 7));
+        let mut spent: Vec<u64> = job.witness.spent.keys().copied().collect();
+        spent.sort_unstable();
+        assert_eq!(spent, [first, first + 2, first + 3]);
+        let (stated, proof) = job.before.clone().unwrap();
+        assert_eq!(stated.digest(), tip.statement);
+        assert_eq!(
+            Some(proof),
+            chain.body(&tip.hash()).unwrap().map(|b| BodyRef::from_bytes(&b).unwrap().proof().to_vec())
+        );
+        // It is its bytes: whoever proves it has no more.
+        let bytes = job.to_bytes();
+        let read = ProveJob::from_bytes(&bytes).unwrap();
+        assert_eq!(read.to_bytes(), bytes);
+        assert_eq!((read.txs.len(), read.start(), read.roots), (2, job.start(), job.roots));
+        // One that has not the path of all it spends is none, nor one
+        // that says of an output what the state does not.
+        let mut lacking = (*job).clone();
+        lacking.witness.spent.remove(&(first + 2));
+        assert!(ProveJob::from_bytes(&lacking.to_bytes()).is_err());
+        let mut other = (*job).clone();
+        other.witness.spent.get_mut(&first).unwrap().amount += 1;
+        assert!(ProveJob::from_bytes(&other.to_bytes()).is_err());
+
+        // A proof that makes the block larger than a block may be.
+        let large = begin().1.proven(&chain, vec![0; chain.params().max_block_size], NOW);
+        assert!(matches!(large.err(), Some(Error::TooLarge(_))));
+        // The proof handed back (any bytes, to this chain): the header,
+        // and the job of finding its nonce.
+        let proven = begun.proven(&chain, vec![7; 1000], NOW).unwrap();
+        let hashing = proven.job();
+        assert_eq!((hashing.height, hashing.target), (height, chain.expected_target(&tip).unwrap()));
+        let (found, _) = hashing.solve(&*table(), 5, &|| false).unwrap();
+        // What is found for another header is not this block's.
+        assert!(proven.block(&Found { hash: [0; 32], ..found }).is_none());
+        let (block, header) = proven.block(&found).unwrap();
+        assert_eq!(header.pow_hash(), hashing.hash);
+        let view = BlockRef::from_bytes(&block).unwrap();
+        assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
+        assert_eq!(view.body().inputs().collect::<Vec<u64>>(), [first, first + 2, first + 3]);
+        assert_eq!(view.body().outputs().count(), 5);
+        assert_eq!(view.body().proof(), [7; 1000]);
+        // What it spent is spent: the same again is no block.
+        assert!(matches!(draft(&chain, &paid, &pooled, &sweeps).unwrap(), Drafted::Stale));
+    }
+
+    /// A proof that is none is refused when it is handed back, by a
+    /// chain that checks proofs: whatever the bytes are.
+    #[cfg(feature = "dev")]
+    #[test]
+    fn a_proof_that_is_none_is_refused() {
+        use crate::chain::headers::tests::easy;
+        use crate::prover::Parts;
+        let verifier = ChainVerifier::of(&Level::SMALL, &Parts::dev());
+        let chain = Chain::open(MemBackend::new(), 8, easy(), seed(), verifier).unwrap();
+        chain.set_dataset(table());
+        let paid = Output::to_key_hash(&[9; 32], reward_due(&chain, &[]).unwrap().unwrap().1);
+        for proof in [vec![], vec![0; 64], vec![0xff; 5000], (0..=255u8).cycle().take(450_000).collect()] {
+            let Drafted::Begun(job, begun) = draft(&chain, &paid, &[], &[]).unwrap() else { panic!("no block begun") };
+            // (The chain's first block: nothing is before it.)
+            assert!(job.before.is_none() && job.txs.is_empty());
+            assert_eq!(begun.proven(&chain, proof, NOW).err(), Some(Error::BadProof));
+        }
+    }
+
+    /// The node's part of a full block: one of 2 MB, of ordinary
+    /// payments of one input or two, and room for its proof. It is
+    /// chosen from the pool, begun, its job written and read back, and
+    /// with a stand-in for its proof and a nonce found the chain takes
+    /// it. Nothing is proven: the chain's proofs go unchecked, as in the
+    /// tests of size the reference has. Said with `--nocapture`: how
+    /// many transactions and signatures that is, how large the job, and
+    /// how long each step took.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "signs thousands of transactions; run with --release")]
+    fn a_full_block_is_begun_and_its_job_written() {
+        let keys = 13_000u32;
+        let (chain, first) = funded(keys);
+        let level = &Level::MAINNET;
+        let txs: Vec<Vec<u8>> =
+            crate::parallel::par_map(keys as usize, |i| payment(i as u32 + 1, first, i % 2 == 1).to_bytes());
+        let mut pool = Mempool::with_policy(1 << 30, crate::mempool::Policy::MAINNET.holding_all());
+        {
+            let state = chain.state();
+            let snap = state.snapshot().unwrap();
+            txs.iter().for_each(|tx| _ = pool.insert(tx, &snap, snap.tip().0 + 1, NOW).unwrap());
+        }
+        assert_eq!(pool.len(), keys as usize);
+        let began = Instant::now();
+        let (pooled, sweeps) = choose(&chain, level, &|f| f(&pool), level.signatures()).unwrap();
+        let chosen = began.elapsed();
+        let signatures: usize = pooled.iter().map(Transaction::weight).sum();
+        let paid = Output::to_key_hash(&[9; 32], reward_due(&chain, &pooled).unwrap().unwrap().1);
+        let began = Instant::now();
+        let Drafted::Begun(job, begun) = draft(&chain, &paid, &pooled, &sweeps).unwrap() else {
+            panic!("no block begun")
+        };
+        let drafted = began.elapsed();
+        let began = Instant::now();
+        let bytes = job.to_bytes();
+        let written = began.elapsed();
+        let began = Instant::now();
+        let read = ProveJob::from_bytes(&bytes).unwrap();
+        let read_in = began.elapsed();
+        assert!(read.to_bytes() == bytes);
+        let proven = begun.proven(&chain, vec![0; PROOF_BYTES], NOW).unwrap();
+        let (found, _) = proven.job().solve(&*table(), 5, &|| false).unwrap();
+        let (block, _) = proven.block(&found).unwrap();
+        // Full: one payment more, the smallest the pool has left, does
+        // not go in. What stops it is the block's size, or the rows the
+        // block's proof has for it, whichever the payments reach first.
+        let max = chain.params().max_block_size;
+        let next = chain.state().snapshot().unwrap().outputs().next;
+        let more = Transaction::from_bytes(&txs[keys as usize - 2]).unwrap();
+        assert!(more.inputs.len() == 1 && pooled.iter().all(|tx| tx.txid() != more.txid()));
+        let with: Vec<Transaction> = pooled.iter().cloned().chain([more]).collect();
+        let (by_rows, by_size) = (!level.fits(next, &with, 0), block.len() + 126 > max);
+        println!(
+            "a full block: {} transactions, {signatures} signatures, {} bytes (full by its proof's rows: {by_rows}; \
+             by its size: {by_size}); its job {} bytes; chosen in {chosen:?}, begun in {drafted:?}, \
+             written in {written:?}, read in {read_in:?}",
+            pooled.len(),
+            block.len(),
+            bytes.len(),
+        );
+        assert!(block.len() <= max && (by_rows || by_size), "{}", block.len());
+        assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
     }
 }

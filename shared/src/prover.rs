@@ -197,6 +197,24 @@ impl Level {
     pub fn signatures(&self) -> usize {
         self.per_proof << self.trees
     }
+
+    /// Whether a block of `txs`, with its reward and `sweeps` sweeps, on
+    /// a state whose next position is `next`, is one a chain takes by
+    /// proofs of this level: its rows are a run's, or a few runs' joined,
+    /// and its signatures no more than a block's proofs hold. For
+    /// whoever chooses a block's transactions, who needs no more of a
+    /// setup than its level.
+    pub fn fits(&self, next: u64, txs: &[Transaction], sweeps: usize) -> bool {
+        let rules: Vec<crate::ledger::Transaction> = txs.iter().map(|tx| tx.rule(|_| ([0; 20], 0))).collect();
+        let ops = txs.iter().map(|tx| tx.ops.len()).sum();
+        let cap = match txs.is_empty() {
+            true => REWARD_ROWS,
+            false => 1 << self.runs[self.runs.len() - 1],
+        };
+        let runs = grouped(next, &rules, ops, sweeps, cap).map_or(usize::MAX, |groups| groups.len());
+        let most = if txs.is_empty() { 1 } else { 1 << self.joins };
+        runs <= most && txs.iter().map(|tx| tx.signings().len()).sum::<usize>() <= self.signatures()
+    }
 }
 
 /// A digest of two elements of a statement.
@@ -296,6 +314,11 @@ impl NamesPart {
                 crate::registry::node(&node, sibling)
             };
         }
+    }
+
+    /// The leaf at `key`, which must be one loaded.
+    pub fn leaf(&self, key: Key) -> Digest {
+        self.nodes[&(0, Self::index(key, 0))]
     }
 
     /// The path of the leaf at `key`, which must be one loaded.
@@ -1078,15 +1101,7 @@ impl Setup {
     /// and its signatures no more than a block's proofs hold. For
     /// whoever chooses a block's transactions.
     pub fn fits(&self, next: u64, txs: &[Transaction], sweeps: usize) -> bool {
-        let rules: Vec<crate::ledger::Transaction> = txs.iter().map(|tx| tx.rule(|_| ([0; 20], 0))).collect();
-        let ops = txs.iter().map(|tx| tx.ops.len()).sum();
-        let cap = match txs.is_empty() {
-            true => REWARD_ROWS,
-            false => 1 << self.level.runs[self.level.runs.len() - 1],
-        };
-        let runs = grouped(next, &rules, ops, sweeps, cap).map_or(usize::MAX, |groups| groups.len());
-        let most = if txs.is_empty() { 1 } else { 1 << self.level.joins };
-        runs <= most && txs.iter().map(|tx| tx.signings().len()).sum::<usize>() <= self.level.signatures()
+        self.level.fits(next, txs, sweeps)
     }
 
     /// The proof of where a chain begins, as the chain's proof before

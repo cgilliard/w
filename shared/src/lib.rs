@@ -28,6 +28,7 @@ pub mod header;
 pub mod heap;
 pub mod hidden;
 pub mod http;
+pub mod job;
 pub mod json;
 pub mod keccak;
 pub mod ledger;
