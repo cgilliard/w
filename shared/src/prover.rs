@@ -30,8 +30,9 @@
 //!   signatures in a tree of one, two, four and so on proofs of a fixed
 //!   number of signatures each (a proof not full is filled by saying a
 //!   signature again: its entry is in the set once more, to no harm).
-//!   On the main network: up to 32 runs of 2^16 rows, and up to 512
-//!   proofs of 64 signatures, more than those runs have room to use.
+//!   On the main network: up to 64 runs of 2^16 rows, and up to 512
+//!   proofs of 64 signatures, which the runs have room to use, and for
+//!   a few inputs more.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -178,7 +179,7 @@ impl Level {
         runs: &[15, 16],
         per_proof: 64,
         trees: 9,
-        joins: 5,
+        joins: 6,
     };
 
     /// For tests and the dev networks: proofs of the kinds of shape the

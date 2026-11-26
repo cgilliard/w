@@ -56,27 +56,30 @@ but its processor proves in good time. It is not a limit of anything
 here: a node set higher gives out larger jobs, up to what the network's
 proofs hold and what a block may be (2 MB).
 
-What the main network's proofs hold is rows: a block's proof joins up
-to 32 runs of 65,536 rows, an input a key signs for takes some 110 of
-them, and an output some 8. So a block spends some 19,000 outputs at
-the most, whatever its size, and the 32,768 signatures its proofs of
-signatures have room for are not reached by inputs. Which a block of
-ordinary payments reaches first, its rows or its 2 MB, is by what the
-payments are: many inputs to an output, the rows.
+What the main network's proofs hold is rows and signatures: a block's
+proof joins up to 64 runs of 65,536 rows, of which an input a key
+signs for takes some 110 and an output some 8, and its proofs of
+signatures hold 32,768. That is room for every signature there may be,
+so a block of ordinary payments is full by its 2 MB. Only one with
+more than some 1.45 inputs to an output is full sooner, by its
+signatures.
 
 Measured (2026-11-25, `a_full_block_is_begun_and_its_job_written`): of
 13,000 payments in the pool, half of one input and half of two, each
-making two outputs, a block took 10,810, which spend 17,310 outputs.
-It was 1,851,376 bytes with 450,000 of them left for its proof, and
-was full by its rows. Its job to prove was 66.6 MB. The node chose
-its transactions in 74 ms, began the block in a second, wrote the job
-in 0.1 s, and read it back in 0.3 s.
+making two outputs, a block took 11,989, which spend 18,489 outputs.
+It was 1,999,930 bytes with 450,000 of them left for its proof, and
+was full by its size. Its job to prove was 71.2 MB. The node chose its
+transactions in 56 ms, began the block in 0.7 s, wrote the job in
+0.1 s, and read it back in 0.3 s.
 
-(Choosing took 189 seconds as the reference has it, asking of the
-whole block again for each transaction tried, and copying every
-signature to count them. `choose` now keeps what the block has taken
-of its proof as it goes, `Level::filled_with`, and chooses the same
-block.)
+(Until that day a block's proof joined 32 runs, as the reference's
+does, and the same pool gave a block of 10,810 payments and 1.85 MB,
+full by its rows: at the 1.9 inputs and 2.4 outputs of a payment on
+Bitcoin's chain that month, some 9,100 payments and 1.87 MB. And
+choosing took 189 seconds as the reference has it, asking of the
+whole block again for each transaction tried: `choose` now keeps what
+the block has taken of its proof as it goes, `Level::filled_with`, and
+chooses the same block.)
 
 ## A job to prove
 

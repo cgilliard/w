@@ -636,6 +636,29 @@ can be borne, and the three ways down are there when one is wanted.
 To be tried when `net` is here: a burst of transactions through a
 line of nodes with small bins, counting what reaches the far end.
 
+### Decided: a block's proof joins 64 runs
+
+Decided on 2026-11-25. The reference's joins 32 (`Level::MAINNET`,
+`joins: 5`), which is room for some 17,600 inputs: a block of
+ordinary payments was full by the rows of its proof before its 2 MB,
+at 1.61 MB of payments of 2.5 inputs and 2.5 outputs, and 1.87 MB of
+Bitcoin's that month (1.9 and 2.4). With 64 (`joins: 6`) the rows hold
+all 32,768 signatures a block's proofs of signatures do, and such
+blocks are full by their size (`docs/WORK.md`).
+
+- It is the network's rules: the plan of shapes is of 81 and not 71,
+  the step's program is another, and a chain of the reference's is not
+  this one's. Neither has been launched.
+- `resources/setup-mainnet.bin` is made again
+  (`write_the_main_network_s_setup`): 42 minutes, and 8.2 GB at the
+  most.
+- A block of one run is proven as it was. Every root is of the size
+  it had, and so is the chain's proof. Measured, two blocks of a
+  reward each way (`main_network_block_timing`): 31.3 and 31.6 seconds
+  with 32 runs, 32.8 and 30.6 with 64; proofs of 426 KB; 4.4 GB.
+- What it costs is one more proof, joining two, for a block of more
+  than 32 runs: whoever proves blocks that large.
+
 ## 11. Open questions
 
 1. **Names.** The two ports' numbers.
