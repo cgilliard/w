@@ -183,28 +183,58 @@ pub fn choose<B: Backend + 'static, V>(
     if most == 0 {
         return Ok((chosen, sweeps));
     }
+    // What a block comes to with the transactions chosen so far: the
+    // signatures it checks, what it spends and makes, the bytes of its
+    // operations on names and its sweeps, and what it has taken of its
+    // proof.
+    #[derive(Clone, Copy)]
+    struct Sum {
+        weight: usize,
+        spends: usize,
+        makes: usize,
+        names: usize,
+        filled: crate::prover::Filled,
+    }
     with_pool(&mut |pool: &Mempool| {
-        // (What is chosen so far, decoded once: the choosing asks of
-        // all of it each time one more is tried.)
+        // What is chosen so far, decoded once, and what it comes to
+        // after each: kept as the choosing goes, so that trying one more
+        // asks of that one alone. (To ask of all of them again for each
+        // one tried is minutes, of a full block.)
         let mut so_far: Vec<Transaction> = Vec::new();
+        let mut sums = vec![Sum {
+            weight: 0,
+            spends: 0,
+            makes: 1,
+            names: sweeps.len() * crate::codec::POSITION_BYTES,
+            filled: level.filled(snap.outputs().next),
+        }];
         let reserve = most * crate::output::INPUT_SIZE * pool.policy().reserve_percent / 100;
         let taken = pool.select(&snap, height, params.min_reveal, reserve, |trying| {
-            so_far.truncate(trying.len() - 1);
-            so_far.push(trying[trying.len() - 1].to_transaction());
-            if so_far.iter().map(Transaction::weight).sum::<usize>() > most {
+            // (Those before the one tried are those chosen: one that
+            // did not go in was never kept.)
+            let chosen = trying.len() - 1;
+            so_far.truncate(chosen);
+            sums.truncate(chosen + 1);
+            let tx = trying[chosen].to_transaction();
+            let before = sums[chosen];
+            let Some(filled) = level.filled_with(&before.filled, &tx) else { return false };
+            let with = Sum {
+                weight: before.weight + tx.weight(),
+                spends: before.spends + tx.inputs.len() + tx.policy_inputs.len(),
+                makes: before.makes + tx.outputs.len(),
+                names: before.names + tx.ops.iter().map(|op| op.block_op().size()).sum::<usize>(),
+                filled,
+            };
+            let size = HEADER_SIZE + Body::size_of(with.spends, with.makes, with.names, PROOF_BYTES);
+            if with.weight > most || size > params.max_block_size || !level.takes(&with.filled, sweeps.len()) {
                 return false;
             }
-            let ops = || so_far.iter().flat_map(|tx| tx.ops.iter());
-            let spends: usize = so_far.iter().map(|tx| tx.inputs.len() + tx.policy_inputs.len()).sum();
-            let makes = 1 + so_far.iter().map(|tx| tx.outputs.len()).sum::<usize>();
-            let names =
-                ops().map(|op| op.block_op().size()).sum::<usize>() + sweeps.len() * crate::codec::POSITION_BYTES;
-            if HEADER_SIZE + Body::size_of(spends, makes, names, PROOF_BYTES) > params.max_block_size {
-                return false;
-            }
-            level.fits(snap.outputs().next, &so_far, sweeps.len())
+            so_far.push(tx);
+            sums.push(with);
+            true
         });
-        chosen = taken.iter().map(|tx| tx.to_transaction()).collect();
+        so_far.truncate(taken.len());
+        chosen = std::mem::take(&mut so_far);
     });
     Ok((chosen, sweeps))
 }
@@ -913,6 +943,12 @@ mod tests {
             }
             let (pooled, sweeps) = choose(&chain, &setup.level, &|f| f(pool), MAX_SIGNATURES).unwrap();
             assert_eq!(pooled.len(), txs.len());
+            // (Chosen one at a time, they are what asking of them all
+            // together takes; and their signatures are counted as many
+            // as they are.)
+            let next = chain.state().snapshot().unwrap().outputs().next;
+            assert!(setup.level.fits(next, &pooled, sweeps.len()));
+            assert!(pooled.iter().all(|tx| tx.signings_len() == tx.signings().len()));
             let pay = Output::to_key_hash(&[0xEE; 32], reward_due(&chain, &pooled).unwrap().unwrap().1);
             let made = mine_with(&chain, setup, dataset, &pay, NOW, 1, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
             let Mined::Block { block, .. } = made else { panic!("{made:?}") };
@@ -1189,6 +1225,12 @@ mod tests {
         let tip = chain.tip().unwrap();
         let (pooled, sweeps) = choose(&chain, level, &|f| f(&pool), MAX_SIGNATURES).unwrap();
         assert_eq!((pooled.len(), sweeps.len()), (2, 0));
+        assert!(level.fits(first + 7, &pooled, 0) && pooled.iter().all(|tx| tx.signings_len() == tx.signings().len()));
+        // No more of them than the signatures to be proven: the two
+        // check three, and the dearer for what it checks goes first.
+        let fewer = choose(&chain, level, &|f| f(&pool), 2).unwrap().0;
+        assert_eq!(fewer.iter().map(Transaction::weight).collect::<Vec<usize>>(), [2]);
+        assert_eq!(choose(&chain, level, &|f| f(&pool), 1).unwrap().0.len(), 1);
         let (height, due) = reward_due(&chain, &pooled).unwrap().unwrap();
         assert_eq!((height, due), (tip.height + 1, chain.params().subsidy(height) + 3 * FEE));
         let paid = Output::to_key_hash(&[9; 32], due);
@@ -1320,6 +1362,8 @@ mod tests {
         let more = Transaction::from_bytes(&txs[keys as usize - 2]).unwrap();
         assert!(more.inputs.len() == 1 && pooled.iter().all(|tx| tx.txid() != more.txid()));
         let with: Vec<Transaction> = pooled.iter().cloned().chain([more]).collect();
+        // (Asked of them all together, as they were not when chosen.)
+        assert!(level.fits(next, &pooled, 0));
         let (by_rows, by_size) = (!level.fits(next, &with, 0), block.len() + 126 > max);
         println!(
             "a full block: {} transactions, {signatures} signatures, {} bytes (full by its proof's rows: {by_rows}; \

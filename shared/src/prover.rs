@@ -213,8 +213,102 @@ impl Level {
         };
         let runs = grouped(next, &rules, ops, sweeps, cap).map_or(usize::MAX, |groups| groups.len());
         let most = if txs.is_empty() { 1 } else { 1 << self.joins };
-        runs <= most && txs.iter().map(|tx| tx.signings().len()).sum::<usize>() <= self.signatures()
+        runs <= most && txs.iter().map(Transaction::signings_len).sum::<usize>() <= self.signatures()
     }
+
+    /// What a block of its reward alone, on a state whose next position
+    /// is `next`, has taken of its proof: where a block being chosen
+    /// begins ([`Level::filled_with`]).
+    pub fn filled(&self, next: u64) -> Filled {
+        Filled { txs: 0, runs: 1, rows: 2 + made_rows(next), position: next + 1, ops: 0, signatures: 0 }
+    }
+
+    /// What a block has taken of its proof with `tx` after the
+    /// transactions it has (`so_far`). `None` if one input of it is more
+    /// than a run holds.
+    ///
+    /// [`Level::fits`] asks of all a block's transactions at once, and
+    /// goes over every one of them to answer. Whoever chooses a block
+    /// asks again for each transaction tried, thousands of times of a
+    /// full block: this is the same reckoning kept as it goes, and the
+    /// two agree ([`Level::takes`]).
+    pub fn filled_with(&self, so_far: &Filled, tx: &Transaction) -> Option<Filled> {
+        let rule = tx.rule(|_| ([0; 20], 0));
+        let mut filled = *so_far;
+        filled.put(&rule, 1 << self.runs[self.runs.len() - 1])?;
+        filled.signatures += tx.signings_len();
+        Some(filled)
+    }
+
+    /// Whether a block that has taken `filled` of its proof, and sweeps
+    /// `sweeps` commitments, is one a chain takes by proofs of this
+    /// level: what [`Level::fits`] says of the same transactions.
+    pub fn takes(&self, filled: &Filled, sweeps: usize) -> bool {
+        let (cap, most) = match filled.txs {
+            0 => (REWARD_ROWS, 1),
+            _ => (1 << self.runs[self.runs.len() - 1], 1 << self.joins),
+        };
+        let mut last = *filled;
+        last.take(tail_rows(filled.ops, sweeps), cap) && last.runs <= most && filled.signatures <= self.signatures()
+    }
+}
+
+/// What a block being chosen has taken of its proof so far
+/// ([`Level::filled`]): the runs begun and the rows of the last, the
+/// position its next output gets, and its operations on names and its
+/// signatures, counted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Filled {
+    txs: usize,
+    runs: usize,
+    rows: usize,
+    position: u64,
+    ops: usize,
+    signatures: usize,
+}
+
+impl Filled {
+    /// Takes `rows` more, in the run in hand or in a new one: whether
+    /// a run of `cap` rows holds them ([`grouped`]'s `put`).
+    fn take(&mut self, rows: usize, cap: usize) -> bool {
+        if self.rows + rows + SETTLE_ROWS > cap {
+            self.runs += 1;
+            self.rows = 1;
+        }
+        self.rows += rows;
+        self.rows + SETTLE_ROWS <= cap
+    }
+
+    /// Takes a transaction, thing by thing, as [`grouped`] deals them
+    /// out. `None` if a thing of it is more than a run holds.
+    fn put(&mut self, rule: &crate::ledger::Transaction, cap: usize) -> Option<()> {
+        let inputs = std::iter::repeat_n(segment::INPUT_ROWS, rule.inputs.len());
+        let policy = rule.policy.iter().map(segment::policy_rows);
+        let position = self.position;
+        let outputs =
+            (0..rule.outputs.len()).map(|k| made_rows(position + k as u64) + (k < rule.covered as usize) as usize);
+        let carried = std::iter::repeat_n(2, rule.ops.len());
+        for rows in std::iter::once(1).chain(inputs).chain(policy).chain(outputs).chain(carried) {
+            if !self.take(rows, cap) {
+                return None;
+            }
+        }
+        self.txs += 1;
+        self.position += rule.outputs.len() as u64;
+        self.ops += rule.ops.len();
+        Some(())
+    }
+}
+
+/// The rows the output that gets `position` takes.
+fn made_rows(position: u64) -> usize {
+    6 + 2 * position.trailing_ones() as usize
+}
+
+/// The rows a block's operations on names and its sweeps take, which
+/// are its last run's.
+fn tail_rows(ops: usize, sweeps: usize) -> usize {
+    ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT) + sweeps * (2 + 2 * OUTPUTS_HEIGHT)
 }
 
 /// A digest of two elements of a statement.
@@ -579,7 +673,7 @@ fn grouped(
     sweeps: usize,
     cap: usize,
 ) -> Option<Vec<Vec<Item>>> {
-    let made = |position: u64| 6 + 2 * position.trailing_ones() as usize;
+    let made = made_rows;
     let input = segment::INPUT_ROWS;
     let mut groups: Vec<Vec<Item>> = vec![vec![Item::Reward]];
     let (mut rows, mut position) = (2 + made(first), first + 1);
@@ -612,9 +706,7 @@ fn grouped(
             }
         }
     }
-    let tail = ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT)
-        + sweeps * (2 + 2 * OUTPUTS_HEIGHT);
-    put(&mut groups, &mut rows, &[], tail).then_some(groups)
+    put(&mut groups, &mut rows, &[], tail_rows(ops, sweeps)).then_some(groups)
 }
 
 /// The proofs of signatures joined into one over `2^tree` of them:
@@ -1473,6 +1565,72 @@ mod tests {
         // More of them than a run holds, or one input that is: no runs.
         assert_eq!(grouped(0, &[], 100, 0, 1 << 11), None);
         assert_eq!(grouped(0, &[rule(1, 1)], 0, 0, 64), None);
+    }
+
+    /// What a block has taken of its proof, kept as its transactions
+    /// are tried one at a time, is what asking of them all together
+    /// says, after every one of them: of payments of every size, some
+    /// with policies' inputs, covered outputs and operations on names,
+    /// from positions of every kind, in runs small enough to be many.
+    #[test]
+    fn a_block_s_fill_kept_as_it_goes_agrees_with_asking_of_the_whole() {
+        use crate::conditions::{Cond, PolicyInput, Shown};
+        use crate::ledger::{Input, Output as Made, Transaction as Rule};
+        use crate::registry::Op;
+        let key = crate::xmss::SecretKey::generate_with_height(&[1; 32], 1).public_key();
+        let memo = Default::default();
+        let made = Made::to(&[1; 32], 5, memo);
+        let mut rng = crate::test_util::Rng::new(0x5eed);
+        let mut below = |n: u64| rng.next_u64() % n;
+        let mut rule = || {
+            let policy = (0..below(3)).map(|i| PolicyInput {
+                amount: 5,
+                memo,
+                created: 1,
+                position: i,
+                conds: vec![Cond::Thresh { m: 1, keys: vec![[2; 32], [3; 32]] }, Cond::Hash([4; 32]), Cond::After(9)],
+                index: 0,
+                siblings: [EMPTY; crate::conditions::DEPTH],
+                shown: vec![Shown::Signers(vec![Some((key, 0)), None]), Shown::Preimage([5; 32]), Shown::Nothing],
+                state: 0,
+            });
+            let (many, wide) = (below(8) == 0, below(8) == 0);
+            let outputs = 1 + below(if wide { 300 } else { 6 }) as usize;
+            Rule {
+                inputs: (0..below(if many { 40 } else { 4 }))
+                    .map(|position| Input { key, amount: 5, memo, created: 1, position })
+                    .collect(),
+                outputs: vec![made; outputs],
+                ops: (0..below(4) / 3).map(|_| Op::Commit { commit: [6; 32], memo }).collect(),
+                policy: policy.collect(),
+                covered: below(outputs as u64 + 1) as u32,
+            }
+        };
+        let mut most_runs = 0;
+        // (The last, runs too small for an input: none holds it.)
+        let cases =
+            [(0u64, 1usize << 11), (7, 1 << 12), (1023, 1 << 12), (1 << 20, 1 << 13), (99_999, 1 << 16), (5, 256)];
+        for (first, cap) in cases {
+            let rules: Vec<Rule> = (0..120).map(|_| rule()).collect();
+            let mut filled =
+                Filled { txs: 0, runs: 1, rows: 2 + made_rows(first), position: first + 1, ops: 0, signatures: 0 };
+            let mut held = true;
+            for n in 0..=rules.len() {
+                if n > 0 {
+                    held = held && filled.put(&rules[n - 1], cap).is_some();
+                }
+                let ops = rules[..n].iter().map(|r| r.ops.len()).sum();
+                for sweeps in [0, 1, 40] {
+                    let whole = grouped(first, &rules[..n], ops, sweeps, cap).map(|groups| groups.len());
+                    let mut last = filled;
+                    let kept = (held && last.take(tail_rows(ops, sweeps), cap)).then_some(last.runs);
+                    assert_eq!(kept, whole, "{n} transactions from {first}, runs of {cap} rows, {sweeps} sweeps");
+                    most_runs = most_runs.max(whole.unwrap_or(0));
+                }
+                assert!(!held || (filled.txs, filled.ops) == (n, ops));
+            }
+        }
+        assert!(most_runs > 8, "{most_runs} runs at the most");
     }
 
     /// The numbers of the main network's setup, as the program has them

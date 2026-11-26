@@ -68,11 +68,15 @@ Measured (2026-11-25, `a_full_block_is_begun_and_its_job_written`): of
 13,000 payments in the pool, half of one input and half of two, each
 making two outputs, a block took 10,810, which spend 17,310 outputs.
 It was 1,851,376 bytes with 450,000 of them left for its proof, and
-was full by its rows. Its job to prove was 66.6 MB. The node began the
-block in a second, wrote the job in 0.2 s, and read it back in 0.5 s.
-Choosing its transactions took 189 seconds, which is far too long, and
-is `choose` asking of the whole block again for each transaction it
-tries: to be mended.
+was full by its rows. Its job to prove was 66.6 MB. The node chose
+its transactions in 74 ms, began the block in a second, wrote the job
+in 0.1 s, and read it back in 0.3 s.
+
+(Choosing took 189 seconds as the reference has it, asking of the
+whole block again for each transaction tried, and copying every
+signature to count them. `choose` now keeps what the block has taken
+of its proof as it goes, `Level::filled_with`, and chooses the same
+block.)
 
 ## A job to prove
 

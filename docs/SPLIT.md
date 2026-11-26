@@ -850,6 +850,12 @@ run together before `miner` came, and its 6 since).
   `fill_table` are `tabshared::job`. `choose` takes a proof's level
   (`Level::fits`) and not a setup, of which a node that proves nothing
   has none.
+- `choose` keeps a sum as it goes and asks of each transaction once
+  (`Level::filled`, `filled_with`, `takes`; `Transaction::signings_len`),
+  where the reference's asks of all it has chosen for each one tried:
+  a full block's 10,810 transactions were 189 seconds to choose, and
+  are 74 ms, the same block. A test holds the sum kept to what
+  `Level::fits` says of the whole, after every transaction.
 - The three things section 6 left to confirm are confirmed, by
   reading: a block's proof takes the items of the work it proves from
   any `ItemSource`, and makes each from the seed text besides, so a

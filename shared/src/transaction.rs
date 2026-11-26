@@ -621,6 +621,18 @@ impl Transaction {
         out
     }
 
+    /// How many signatures the transaction rests on: as many as
+    /// [`Transaction::signings`] gives, without making them.
+    pub fn signings_len(&self) -> usize {
+        let of_policies =
+            self.policy_inputs.iter().flat_map(|p| p.leaf.conds.iter().zip(&p.witness)).map(|pair| match pair {
+                (crate::policy::Cond::Thresh { .. }, crate::policy::CondWitness::Signatures(signers)) => signers.len(),
+                _ => 0,
+            });
+        let of_updates = self.ops.iter().filter(|op| matches!(op, NameOp::Update { .. })).count();
+        self.inputs.len() + of_policies.sum::<usize>() + of_updates
+    }
+
     /// Hash of the body, excluding signatures.
     pub fn body_hash(&self) -> Digest {
         owned_body!(self.inputs.iter().map(|i| (i.pubkey, i.amount, i.position)), self, body_hash)
